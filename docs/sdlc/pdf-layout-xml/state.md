@@ -2,7 +2,7 @@
 
 - **Branch:** `sdlc/pdf-layout-xml` (base: `main`; both unborn until the first commit)
 - **Iteration:** 2 of max 5
-- **Lanes:** iteration 1 done (1a merged as `eb494f3`, retro CONTINUE). Iteration 2 at 3 Plan: lanes #3, #5, #6
+- **Lanes:** iteration 2: 2a (#6) at 4 Build · 2b (#3) at 4 Build · 2c (#5) at 4 Build
 - **Gates:** requirements ✅ approved 2026-11-05 · design ✅ approved 2026-11-05 · release ⏳
 - **Mode:** interactive · verify: auto
 
