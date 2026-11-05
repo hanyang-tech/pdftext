@@ -5,10 +5,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from pdftext.adapter import open_document
+from pdftext.adapter import Document, open_document
 from pdftext.limits import DEFAULT_LIMITS, Limits
 from pdftext.model import Page, PageStatus
-from pdftext.pipeline import compose_page
+from pdftext.pipeline import compose_page, error_page
 from pdftext.xmlwriter import (
     DOCUMENT_NAME,
     OutputDir,
@@ -31,8 +31,17 @@ def iter_pages(path: str | os.PathLike[str], *, limits: Limits = DEFAULT_LIMITS)
     This is a generator, so errors from opening the file are raised at the first `next`.
     """
     with open_document(Path(path), limits) as document:
-        while (raw_page := document.read_next()) is not None:
-            yield compose_page(raw_page, max_table_depth=limits.max_table_depth)
+        while document.advance():
+            yield _read_page(document, limits)
+
+
+def _read_page(document: Document, limits: Limits) -> Page:
+    """Read and compose the page `document` is on. A fault in it becomes an error page."""
+    try:
+        return compose_page(document.read(), max_table_depth=limits.max_table_depth)
+    except Exception as exc:
+        message = f"page processing failed: {type(exc).__name__}"
+        return error_page(document.page_number, document.page_bbox, message)
 
 
 def convert(

@@ -18,7 +18,10 @@ GLYPH = 0.6  # the test font's glyph width in ems
 
 def read_pages(path):
     with open_document(path, DEFAULT_LIMITS) as document:
-        return list(iter(document.read_next, None))
+        pages = []
+        while document.advance():
+            pages.append(document.read())
+        return pages
 
 
 def write_pdf(tmp_path, pages):
@@ -131,20 +134,22 @@ class TestClosing:
         with open_document(write_pdf(tmp_path, pages), DEFAULT_LIMITS) as document:
             seen = []
             for _ in range(3):
-                document.read_next()
+                document.advance()
+                document.read()
                 seen.append(list(closed_pages))
 
         assert seen == [[1], [1, 2], [1, 2, 3]]
 
     def test_closes_a_page_whose_reading_failed(self, tmp_path, closed_pages, monkeypatch):
-        def fail(page, number):
+        def fail(page, number, bbox):
             raise RuntimeError("boom")
 
         monkeypatch.setattr(adapter, "_read_page", fail)
         path = write_pdf(tmp_path, [pdfgen.PageSpec()])
 
         with open_document(path, DEFAULT_LIMITS) as document, pytest.raises(RuntimeError):
-            document.read_next()
+            document.advance()
+            document.read()
 
         assert closed_pages == [1]
 

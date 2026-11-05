@@ -4,7 +4,7 @@ import sys
 import pytest
 
 import pdfgen
-from pdftext import ConversionResult, Limits, cli
+from pdftext import ConversionResult, Limits, adapter, cli
 from pdftext.cli import main
 
 
@@ -65,6 +65,12 @@ class TestMain:
         assert code == 2
         assert stderr_lines(capsys)[0] == ["pdftext: error: input is not a valid PDF"]
         assert not (out / "document.xml").exists()
+
+    def test_refuses_an_input_path_holding_a_nul_byte_with_one_line(self, tmp_path, capsys):
+        code = main([str(tmp_path / "a\0b.pdf"), "-o", str(tmp_path / "out")])
+
+        assert code == 2
+        assert stderr_lines(capsys)[0] == ["pdftext: error: cannot read input file"]
 
     def test_refuses_a_missing_input_with_one_line(self, tmp_path, capsys):
         code = main([str(tmp_path / "missing.pdf"), "-o", str(tmp_path / "out")])
@@ -193,6 +199,25 @@ class TestMain:
 
         assert main(["in.pdf", "-o", "out"]) == 1
         assert stderr_lines(capsys)[0] == ["pdftext: error: internal error: RuntimeError"]
+
+    def test_exits_two_when_the_input_cannot_be_read_part_way_through(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        real_walk = adapter._walk_pages
+
+        def walk_then_fail_to_read(doc):
+            entries = real_walk(doc)
+            yield next(entries)
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(adapter, "_walk_pages", walk_then_fail_to_read)
+        source = tmp_path / "two.pdf"
+        source.write_bytes(pdfgen.build_pdf(pdfgen.numbered_pages(2)))
+
+        code = main([str(source), "-o", str(tmp_path / "out")])
+
+        assert code == 2
+        assert stderr_lines(capsys)[0] == ["pdftext: error: input is not a valid PDF"]
 
     def test_prints_the_version(self, capsys):
         with pytest.raises(SystemExit) as stop:

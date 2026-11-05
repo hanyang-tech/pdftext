@@ -20,7 +20,7 @@ def parser_imports(path: Path) -> set[str]:
 
 
 def test_the_scan_sees_the_adapter_import_the_parser():
-    assert parser_imports(SOURCE / "adapter.py") == {"pdfplumber", "pdfminer"}
+    assert parser_imports(SOURCE / "adapter.py") == {"pdfplumber", "pdfminer", "pypdfium2"}
 
 
 @pytest.mark.parametrize(

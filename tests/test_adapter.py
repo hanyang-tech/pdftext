@@ -1,5 +1,3 @@
-from itertools import count
-
 import pytest
 from pdfminer.pdfdocument import PDFPasswordIncorrect
 from pdfminer.pdfexceptions import PDFException
@@ -15,7 +13,10 @@ from pdftext.model import BBox
 
 def read_pages(path):
     with open_document(path, DEFAULT_LIMITS) as document:
-        return list(iter(document.read_next, None))
+        pages = []
+        while document.advance():
+            pages.append(document.read())
+        return pages
 
 
 def write_pdf(tmp_path, pages, name="doc.pdf"):
@@ -24,7 +25,7 @@ def write_pdf(tmp_path, pages, name="doc.pdf"):
     return path
 
 
-class TestReadNext:
+class TestRead:
     def test_reads_chars_with_position_size_and_sequence(self, fixtures):
         (page,) = read_pages(fixtures / "A_floating.pdf")
 
@@ -141,24 +142,53 @@ class TestReadNext:
 
         assert page.images == (BBox(50, 642, 150, 692),)
 
-    def test_reads_each_page_only_when_asked_and_ends_with_none(self, tmp_path):
+    def test_steps_through_the_pages_one_at_a_time_and_ends_with_false(self, tmp_path):
         path = write_pdf(tmp_path, pdfgen.dense_pages(3, lines_per_page=1, words_per_line=1))
 
         with open_document(path, DEFAULT_LIMITS) as document:
             assert document.page_number == 0
             assert document.page_bbox == BBox(0, 0, 0, 0)
             numbers = []
-            while (page := document.read_next()) is not None:
-                numbers.append((page.number, document.page_number))
-            assert document.read_next() is None
+            while document.advance():
+                numbers.append((document.page_number, document.read().number))
+            assert document.advance() is False
 
         assert numbers == [(1, 1), (2, 2), (3, 3)]
 
-    def test_remembers_the_box_of_the_page_last_started(self, fixtures):
+    def test_stays_at_the_end_and_refuses_to_read_after_the_last_page(self, fixtures):
+        with open_document(fixtures / "nested.pdf", DEFAULT_LIMITS) as document:
+            while document.advance():
+                document.read()
+
+            assert (document.advance(), document.advance()) == (False, False)
+            with pytest.raises(RuntimeError, match="advance"):
+                document.read()
+
+    def test_knows_the_box_of_a_page_once_it_is_read_and_not_before(self, fixtures):
         with open_document(fixtures / "H_rotate90.pdf", DEFAULT_LIMITS) as document:
-            document.read_next()
+            document.advance()
+            assert document.page_bbox == BBox(0, 0, 0, 0)
+
+            document.read()
 
             assert document.page_bbox == BBox(0, 0, 792, 612)
+
+    def test_resets_the_box_when_it_steps_to_the_next_page(self, fixtures):
+        with open_document(fixtures / "nested.pdf", DEFAULT_LIMITS) as document:
+            document.advance()
+            document.read()
+            assert document.page_bbox == BBox(0, 0, 612, 792)
+
+            document.advance()
+
+            assert document.page_bbox == BBox(0, 0, 0, 0)
+
+    def test_refuses_to_read_before_the_first_step(self, fixtures):
+        with (
+            open_document(fixtures / "nested.pdf", DEFAULT_LIMITS) as document,
+            pytest.raises(RuntimeError, match="advance"),
+        ):
+            document.read()
 
     def test_reads_the_declared_page_count(self, tmp_path):
         path = write_pdf(tmp_path, pdfgen.dense_pages(4, lines_per_page=1, words_per_line=1))
@@ -183,8 +213,12 @@ class TestReadNext:
             assert document.declared_pages is None
 
     def test_reports_no_declared_count_when_the_parser_cannot_read_it(self, tmp_path, monkeypatch):
-        def refuse(_obj):
-            raise PDFException("unreadable")
+        def refuse(obj):
+            if isinstance(obj, int):  # the /Count value, the only number the adapter resolves
+                raise PDFException("unreadable")
+            return real_resolve1(obj)
+
+        real_resolve1 = adapter.resolve1
 
         path = write_pdf(tmp_path, [pdfgen.PageSpec()])
         monkeypatch.setattr(adapter, "resolve1", refuse)
@@ -273,31 +307,104 @@ class TestOpenDocument:
             assert document._pdf.doc.caching is False
 
 
-def test_a_page_tree_that_fails_before_its_first_page_is_invalid_input(tmp_path, monkeypatch):
-    def failing(doc):
-        raise RuntimeError("broken page tree")
-        yield  # makes this a generator, like the real one
+class TestRootOfThePageTree:
+    def test_a_fault_before_the_first_entry_is_invalid_input(self, tmp_path, monkeypatch):
+        def failing(doc):
+            raise RuntimeError("broken page tree")
+            yield  # makes this a generator, like the real one
 
-    monkeypatch.setattr(adapter.PDFPage, "create_pages", failing)
+        monkeypatch.setattr(adapter, "_walk_pages", failing)
 
-    with pytest.raises(InvalidPdfError, match="not a valid PDF"):
-        open_document(write_pdf(tmp_path, [pdfgen.PageSpec()]), DEFAULT_LIMITS)
-
-
-def test_a_page_tree_that_fails_midway_ends_the_run_as_invalid_input(tmp_path, monkeypatch):
-    path = write_pdf(tmp_path, pdfgen.dense_pages(3, lines_per_page=1, words_per_line=1))
-    real_create_pages = adapter.PDFPage.create_pages
-
-    def failing_after_two(doc):
-        for index, page_object in zip(count(), real_create_pages(doc), strict=False):
-            if index == 2:
-                raise RuntimeError("broken page tree")
-            yield page_object
-
-    monkeypatch.setattr(adapter.PDFPage, "create_pages", failing_after_two)
-
-    with open_document(path, DEFAULT_LIMITS) as document:
-        document.read_next()
-        document.read_next()
         with pytest.raises(InvalidPdfError, match="not a valid PDF"):
-            document.read_next()
+            open_document(write_pdf(tmp_path, [pdfgen.PageSpec()]), DEFAULT_LIMITS)
+
+    def test_a_fault_between_entries_ends_the_run_as_invalid_input(self, tmp_path, monkeypatch):
+        path = write_pdf(tmp_path, pdfgen.dense_pages(3, lines_per_page=1, words_per_line=1))
+        real_walk = adapter._walk_pages
+
+        def failing_after_two(doc):
+            entries = real_walk(doc)
+            yield next(entries)
+            yield next(entries)
+            raise RuntimeError("broken page tree")
+
+        monkeypatch.setattr(adapter, "_walk_pages", failing_after_two)
+
+        with open_document(path, DEFAULT_LIMITS) as document:
+            assert document.advance() and document.advance()
+            with pytest.raises(InvalidPdfError, match="not a valid PDF"):
+                document.advance()
+
+    def test_falls_back_to_the_pages_in_the_file_when_the_catalog_has_no_page_tree(self, tmp_path):
+        objects = pdfgen.build_objects(pdfgen.numbered_pages(3))
+        objects[1] = b"<< /Type /Catalog >>"
+        path = tmp_path / "no-tree.pdf"
+        path.write_bytes(pdfgen.serialise(objects))
+
+        pages = read_pages(path)
+
+        assert [page.number for page in pages] == [1, 2, 3]
+        assert [len(page.chars) for page in pages] == [5, 5, 5]
+
+    def test_gives_a_page_the_media_box_of_its_branch(self, tmp_path):
+        objects = pdfgen.build_objects(pdfgen.numbered_pages(2))
+        first, second = pdfgen.page_object_id(0), pdfgen.page_object_id(1)
+        for page_id in (first, second):
+            objects[page_id] = objects[page_id].replace(b"/MediaBox [0 0 612 792]", b"")
+        objects[9] = b"<< /Type /Pages /Parent 2 0 R /Kids [5 0 R 7 0 R] /MediaBox [0 0 300 400] >>"
+        objects[2] = b"<< /Type /Pages /Kids [9 0 R] /Count 2 >>"
+        path = tmp_path / "inherited.pdf"
+        path.write_bytes(pdfgen.serialise(objects))
+
+        pages = read_pages(path)
+
+        assert [page.bbox for page in pages] == [BBox(0, 0, 300, 400)] * 2
+
+    def test_a_page_keeps_its_own_media_box_over_the_one_of_its_branch(self, tmp_path):
+        objects = pdfgen.build_objects(pdfgen.numbered_pages(2))
+        objects[7] = objects[7].replace(b"/MediaBox [0 0 612 792]", b"")
+        objects[9] = b"<< /Type /Pages /Parent 2 0 R /Kids [5 0 R 7 0 R] /MediaBox [0 0 300 400] >>"
+        objects[2] = b"<< /Type /Pages /Kids [9 0 R] /Count 2 /MediaBox [0 0 100 100] >>"
+        path = tmp_path / "own-box.pdf"
+        path.write_bytes(pdfgen.serialise(objects))
+
+        pages = read_pages(path)
+
+        assert [page.bbox for page in pages] == [BBox(0, 0, 612, 792), BBox(0, 0, 300, 400)]
+
+    def test_accepts_a_page_whose_type_key_is_written_in_lower_case(self, tmp_path):
+        objects = pdfgen.build_objects(pdfgen.numbered_pages(3))
+        objects[7] = objects[7].replace(b"/Type /Page", b"/type /Page")
+        path = tmp_path / "lower.pdf"
+        path.write_bytes(pdfgen.serialise(objects))
+
+        pages = read_pages(path)
+
+        assert ["".join(char.text for char in page.chars) for page in pages] == [
+            "PAGE1",
+            "PAGE2",
+            "PAGE3",
+        ]
+
+
+class TestOrderOfOpening:
+    def test_reads_the_declared_count_before_the_first_page_tree_step(self, tmp_path, monkeypatch):
+        order = []
+        real_count, real_walk = adapter._declared_page_count, adapter._walk_pages
+
+        def count(doc):
+            order.append("count")
+            return real_count(doc)
+
+        def walk(doc):
+            entries = real_walk(doc)
+            order.append("walk")
+            yield from entries
+
+        monkeypatch.setattr(adapter, "_declared_page_count", count)
+        monkeypatch.setattr(adapter, "_walk_pages", walk)
+
+        with open_document(write_pdf(tmp_path, [pdfgen.PageSpec()]), DEFAULT_LIMITS):
+            pass
+
+        assert order == ["count", "walk"]

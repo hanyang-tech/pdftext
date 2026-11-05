@@ -1,4 +1,4 @@
-"""Parser log text never reaches the terminal or a host application's logging (AC-19)."""
+"""Parser log text never reaches the terminal or a host application's logging (SEC-8)."""
 
 import logging
 import subprocess
@@ -31,7 +31,7 @@ def hostile_name_pdf():
     )
 
 
-def test_a_page_without_a_media_box_gives_one_line_on_stderr_and_nothing_on_stdout(tmp_path):
+def test_a_page_without_a_media_box_is_an_error_page_and_adds_nothing_to_stderr(tmp_path):
     source = tmp_path / "nobox.pdf"
     source.write_bytes(no_media_box_pdf())
 
@@ -42,11 +42,9 @@ def test_a_page_without_a_media_box_gives_one_line_on_stderr_and_nothing_on_stdo
         check=False,
     )
 
-    assert run.returncode != 0
+    assert run.returncode == 3
     assert run.stdout == b""
-    lines = run.stderr.decode().splitlines()
-    assert len(lines) == 1
-    assert lines[0].startswith("pdftext: error: ")
+    assert run.stderr == b""
 
 
 class Collector(logging.Handler):

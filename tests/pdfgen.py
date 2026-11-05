@@ -6,6 +6,8 @@ characters XML forbids, can therefore appear in a PDF that pdfminer reads back a
 Coordinates are PDF user space: points, origin at the bottom left.
 """
 
+import hashlib
+import struct
 from dataclasses import dataclass
 from itertools import count
 
@@ -29,10 +31,24 @@ class PageSpec:
     transform: tuple[float, float, float, float, float, float] | None = None  # a `cm` for the text
 
 
+def page_object_id(index: int) -> int:
+    """The object number of page `index` (from 0) in a PDF made by `build_objects`."""
+    return 5 + 2 * index
+
+
 def build_pdf(pages: list[PageSpec]) -> bytes:
     """Return the bytes of a PDF with one page per spec."""
+    return serialise(build_objects(pages))
+
+
+def build_objects(pages: list[PageSpec]) -> dict[int, bytes]:
+    """The numbered objects of `build_pdf`, so a test can damage one before `serialise`.
+
+    Object 2 is the page tree and object `page_object_id(index)` is page `index`, followed by its
+    content stream. Objects 1 to 4 are the catalog, the tree, the font and its ToUnicode map.
+    """
     codes = _assign_codes(pages)
-    page_ids = [5 + 2 * index for index in range(len(pages))]
+    page_ids = [page_object_id(index) for index in range(len(pages))]
     objects: dict[int, bytes] = {
         1: b"<< /Type /Catalog /Pages 2 0 R >>",
         2: _pages_object(page_ids),
@@ -42,7 +58,7 @@ def build_pdf(pages: list[PageSpec]) -> bytes:
     for page_id, page in zip(page_ids, pages, strict=True):
         objects[page_id] = _page_object(page, page_id + 1)
         objects[page_id + 1] = _stream(_content(page, codes))
-    return serialise(objects)
+    return objects
 
 
 def dense_pages(
@@ -63,6 +79,11 @@ def dense_pages(
         )
         for page in range(page_count)
     ]
+
+
+def numbered_pages(count: int) -> list[PageSpec]:
+    """Pages that each hold one word, `PAGE1`, `PAGE2` and so on, so a wrong page shows."""
+    return [PageSpec((TextItem(50, 700, f"PAGE{number}"),)) for number in range(1, count + 1)]
 
 
 def _assign_codes(pages: list[PageSpec]) -> dict[str, int]:
@@ -122,7 +143,8 @@ def _content(page: PageSpec, codes: dict[str, int]) -> bytes:
         for item in page.texts
     ]
     if page.transform is not None:
-        matrix = " ".join(f"{value:g}" for value in page.transform)
+        # Fixed-point, because PDF has no exponent notation, so a huge value is written in full.
+        matrix = " ".join(f"{value:f}" for value in page.transform)
         operations = [f"q {matrix} cm", *operations, "Q"]
     return "\n".join(operations).encode("ascii")
 
@@ -152,7 +174,10 @@ def build_image_pdf(
     image: tuple[float, float, float, float],
     mediabox: tuple[float, float, float, float] = (0, 0, 612, 792),
 ) -> bytes:
-    """A one-page PDF holding only a grey image, drawn at `image` as (x, y, width, height)."""
+    """A one-page PDF holding only a grey image, drawn at `image` as (x, y, width, height).
+
+    Numbers are written in fixed point, because PDF has no exponent notation.
+    """
     x, y, width, height = image
     box = " ".join(f"{value:g}" for value in mediabox)
     objects = {
@@ -166,6 +191,70 @@ def build_image_pdf(
             b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 "
             b"/ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\x00\nendstream"
         ),
-        5: _stream(f"q {width:g} 0 0 {height:g} {x:g} {y:g} cm /Im Do Q".encode()),
+        5: _stream(f"q {width:f} 0 0 {height:f} {x:f} {y:f} cm /Im Do Q".encode()),
     }
     return serialise(objects)
+
+
+_PAD = bytes.fromhex("28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A")
+_FILE_ID = bytes(range(16))
+_PERMISSIONS = -4
+
+
+def build_encrypted_pdf(user_password: str, pages: list[PageSpec] | None = None) -> bytes:
+    """A PDF protected with a user password, by the standard handler (RC4, 40 bit).
+
+    Every stream is encrypted with its own object key, as a real file is, so with the right
+    password (the empty one included) a reader gets the pages back as `build_pdf` writes them.
+    The owner password is the user password, which is all the password check needs.
+    """
+    user = _padded(user_password)
+    owner_key = hashlib.md5(user, usedforsecurity=False).digest()[:5]
+    owner_entry = _rc4(owner_key, user)
+    key = hashlib.md5(
+        user + owner_entry + struct.pack("<i", _PERMISSIONS) + _FILE_ID, usedforsecurity=False
+    ).digest()[:5]
+    user_entry = _rc4(key, _PAD)
+    encrypt = (
+        f"<< /Filter /Standard /V 1 /R 2 /P {_PERMISSIONS} "
+        f"/O <{owner_entry.hex()}> /U <{user_entry.hex()}> >>"
+    )
+    objects = {
+        number: _encrypt_stream(body, number, key)
+        for number, body in build_objects(pages if pages is not None else [PageSpec()]).items()
+    }
+    return serialise(
+        objects,
+        trailer_extra=f"/Encrypt {encrypt} /ID [<{_FILE_ID.hex()}> <{_FILE_ID.hex()}>]",
+    )
+
+
+def _encrypt_stream(body: bytes, number: int, key: bytes) -> bytes:
+    head, separator, rest = body.partition(b"stream\n")
+    if not separator:
+        return body
+    data, tail_separator, tail = rest.rpartition(b"\nendstream")
+    object_key = hashlib.md5(
+        key + struct.pack("<I", number)[:3] + b"\x00\x00", usedforsecurity=False
+    ).digest()[: len(key) + 5]
+    return head + separator + _rc4(object_key, data) + tail_separator + tail
+
+
+def _padded(password: str) -> bytes:
+    return (password.encode("latin-1") + _PAD)[:32]
+
+
+def _rc4(key: bytes, data: bytes) -> bytes:
+    state = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + state[i] + key[i % len(key)]) % 256
+        state[i], state[j] = state[j], state[i]
+    out = bytearray()
+    i = j = 0
+    for byte in data:
+        i = (i + 1) % 256
+        j = (j + state[i]) % 256
+        state[i], state[j] = state[j], state[i]
+        out.append(byte ^ state[(state[i] + state[j]) % 256])
+    return bytes(out)

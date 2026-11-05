@@ -45,21 +45,27 @@ def visible_chars(text):
 class TestIterPages:
     def test_reads_only_the_first_page_when_only_the_first_is_taken(self, tmp_path, monkeypatch):
         path = write_pdf(tmp_path, pdfgen.dense_pages(200))
-        reads = []
-        real_read_next = adapter.Document.read_next
+        steps = []
+        real_advance = adapter.Document.advance
+        real_read = adapter.Document.read
 
-        def counting_read_next(self):
-            reads.append(self.page_number)
-            return real_read_next(self)
+        def counting_advance(self):
+            steps.append(("advance", self.page_number))
+            return real_advance(self)
 
-        monkeypatch.setattr(adapter.Document, "read_next", counting_read_next)
+        def counting_read(self):
+            steps.append(("read", self.page_number))
+            return real_read(self)
+
+        monkeypatch.setattr(adapter.Document, "advance", counting_advance)
+        monkeypatch.setattr(adapter.Document, "read", counting_read)
 
         pages = pdftext.iter_pages(path)
         first = next(pages)
         pages.close()
 
         assert first.number == 1
-        assert reads == [0]
+        assert steps == [("advance", 0), ("read", 1)]
 
     def test_yields_pages_in_order(self, tmp_path):
         path = write_pdf(tmp_path, pdfgen.dense_pages(3, lines_per_page=2, words_per_line=2))
@@ -151,6 +157,21 @@ class TestConvert:
 
         assert parse(out / "page-0001.xml").get("status") == "no-text"
         assert parse(out / "document.xml")[0].get("status") == "no-text"
+
+    @pytest.mark.parametrize("space", ["\u00a0", "\u3000", "\u2003", "\t", " "])
+    def test_ends_a_word_at_any_unicode_space_and_writes_no_word_for_a_page_of_only_spaces(
+        self, tmp_path, space
+    ):
+        spaced = pdfgen.PageSpec((pdfgen.TextItem(50, 700, f"10{space}km"),))
+        only_spaces = pdfgen.PageSpec((pdfgen.TextItem(50, 700, space * 3),))
+        out = tmp_path / "out"
+
+        pdftext.convert(write_pdf(tmp_path, [spaced, only_spaces]), out)
+
+        spaced_page, empty_page = parse(out / "page-0001.xml"), parse(out / "page-0002.xml")
+        assert [word.text for word in spaced_page.iter("word")] == ["10", "km"]
+        assert empty_page.get("status") == "no-text"
+        assert list(empty_page.iter("word")) == []
 
     def test_gives_every_element_a_bbox_and_places_nest_where_the_pdf_draws_it(
         self, fixtures, tmp_path
@@ -328,14 +349,14 @@ class TestFailedRuns:
     def test_a_run_that_stops_midway_writes_no_document(self, tmp_path, monkeypatch):
         path = write_pdf(tmp_path, pdfgen.dense_pages(3, 1, 1))
         out = tmp_path / "out"
-        real_read_next = adapter.Document.read_next
+        real_advance = adapter.Document.advance
 
         def failing_on_third(self):
             if self.page_number == 2:
                 raise InvalidPdfError("input is not a valid PDF")
-            return real_read_next(self)
+            return real_advance(self)
 
-        monkeypatch.setattr(adapter.Document, "read_next", failing_on_third)
+        monkeypatch.setattr(adapter.Document, "advance", failing_on_third)
 
         with pytest.raises(InvalidPdfError):
             pdftext.convert(path, out)
