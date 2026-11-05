@@ -15,7 +15,7 @@ Turn digital PDFs into layout-aware XML, so that programs can consume a document
 Fixture names refer to `spike/fixtures/`. Coordinates are points, with a top-left origin, in the page's displayed orientation.
 
 ### Output
-- **AC-1** `pdftext input.pdf -o out/` on an N-page PDF → exit 0, with `out/document.xml` listing every page and one `out/page-0001.xml` … per page.
+- **AC-1** `pdftext input.pdf -o out/` on an N-page PDF → exit 0, with `out/document.xml` listing every page and one `out/page-0001.xml` … per page. "Every page" means every entry in the page tree. A well-formed tree that lists fewer pages than its `/Count` declares isn't flagged; the user accepted this as a known limit (design Risk 11).
 - **AC-2** The library's `iter_pages(path)` yields one page result at a time: taking the first page of a 200-page PDF processes only that page.
 - **AC-3** All output is well-formed and validates against an XSD shipped with the package.
 - **AC-4** Every `page`, `region`, `line`, `word`, `table`, `row`, `cell` and `figure` element has a `bbox` of `x0 y0 x1 y1`. In fixture A, the word `Nest` in the first nested cell starts at x0 = 280.00 ± 0.01.
@@ -37,9 +37,9 @@ Fixture names refer to `spike/fixtures/`. Coordinates are points, with a top-lef
 - **AC-16** The prose page in `nested.pdf` produces no text-detected table.
 
 ### Failure handling
-- **AC-17** A page with no text → `status="no-text"`. Images are `figure` elements with a bbox.
-- **AC-18** An exception while processing one page → that page's file has `status="error"` and a message, every other page is written normally, and the exit code is 3.
-- **AC-19** Garbage or truncated input → a one-line error with no traceback, exit 2, and no `document.xml`.
+- **AC-17** A page with no text → `status="no-text"`. Images are `figure` elements with a bbox. Whitespace is whatever Python's `str.isspace()` accepts: NBSP, U+3000 and every other Unicode space end a word and aren't written, so `10`, NBSP, `km` is two words, and a page holding only whitespace is `no-text`.
+- **AC-18** An exception while processing one page, including a fault in that page's own page-tree entry → that page's file has `status="error"` and a message, every other page is written normally, and the exit code is 3. Accepted exceptions (design Risk 10): a fault in the root `/Pages` node or its `/Kids` array, or a stop landing in the page walker's own code between entries, ends the run with exit 2; a failing `/Pages` node below the root becomes one error page for its whole subtree; a page-1 fault that PDFium repairs gives the repaired output.
+- **AC-19** Garbage or truncated input → a one-line error with no traceback, exit 2, and no `document.xml`. A file whose page tree opens but whose first entry fails even after repair is not garbage: it gives a page-1 error page and exit 3 (fixture K flip3).
 - **AC-20** Password-protected input → its own one-line error, exit 2.
 - **AC-21** A PDF with a broken cross-reference table is repaired through PDFium, and its output matches the undamaged file's.
 
@@ -58,14 +58,20 @@ Fixture names refer to `spike/fixtures/`. Coordinates are points, with a top-lef
 - **SEC-5 [security]** A file over `--max-file-bytes` is refused before the parser opens it. `/Count` over `--max-pages` is refused before any page is read. More real pages than a falsely small `/Count` declares stop at the limit. All exit 2 with no `document.xml`.
 - **SEC-6 [security]** A page with more characters than `--max-chars-per-page` → that page has `status="error"`, other pages are normal, exit 3.
 - **SEC-7 [security]** 40 tables nested inside each other → output validates, table depth is at most 16, INV-1 holds.
-- **SEC-8 [security]** Every `message` matches the closed vocabulary, even when the exception text holds markup. An input filename with ESC and a newline gives exactly one stderr line with no control characters.
+- **SEC-8 [security]** Every `message` matches the closed vocabulary, even when the exception text holds markup. An input filename with ESC and a newline gives exactly one stderr line with no control characters. A PDF whose `/Info` has a key holding ESC and a newline with an undecodable value (`/Evil#1b#5B31m#0AFAKE 5 0 R`, `5 0 obj << /A 5 0 R >>`) gives exit 0 and empty stderr, and a `/Page` with no MediaBox adds nothing to stderr. Nothing logged by the `pdfminer` or `pdfplumber` loggers reaches stderr or a handler on the root logger.
 - **SEC-9 [security]** A planted symlink at `out/page-0001.xml`, `out/document.xml` or `out/.page-0001.xml.tmp` → the link's target is unchanged and the output is correct.
 - **SEC-10 [security]** A run that fails, with an old `document.xml` in the output directory → no `document.xml` afterwards, and no stale `page-*.xml` from a larger earlier run.
 - **SEC-11 [security]** Output from the same PDF at two different input and output paths is byte-identical and holds neither path.
 - **SEC-12 [security]** Under `sys.addaudithook`, normal, repaired and invalid inputs raise no subprocess or socket events, and no write opens outside the output directory.
 - **SEC-13 [security]** A font with `/Encoding /../../../../etc/passwd` opens nothing outside pdfminer's CMap directory, and `pyproject.toml` requires `pdfminer.six>=20251107`.
-- **SEC-14 [security]** A page whose transforms overflow to infinity → that page has `status="error"`, output validates, exit 3.
+- **SEC-14 [security]** A page whose transforms overflow to infinity → that page has `status="error"` and its own `0 0 W H` bbox. A page whose MediaBox gives a non-finite width or height (`[0 0 <400-digit number> 100]` gives infinity; the same number as both x0 and x1 gives NaN) → that page has `status="error"` and `bbox="0.00 0.00 0.00 0.00"` in both its page file and `document.xml`. In both cases output validates, other pages are normal, exit 3.
 - **SEC-15 [security]** Encrypted, over-limit and normally parsing inputs never call pypdfium2 (spy test).
+- **SEC-16 [security]** With `--page-timeout 1`:
+  - A two-object reference cycle at `/Pages`, at the root's `/Kids` or at `/Count` → one stderr line and exit 2 within 3 s, no `document.xml` and no `page-*.xml`, pypdfium2 not called.
+  - On a 4-page PDF, a cycle in page 3's `/Contents` or its `/Kids` entry, or `/MediaBox 99 0 R` with no object 99 → `page-0003.xml` has `status="error"`, `bbox="0.00 0.00 0.00 0.00"` and a closed-vocabulary message; pages 1, 2 and 4 hold their own text with no error; `document.xml` lists 4 pages; output validates; exit 3 within 3 s; `iter_pages` yields 4 pages, the third an error page.
+  - The same cycle in page 1's `/Contents` → page 1 `status="error"`, pages 2 to 4 normal, exit 3, pypdfium2 not called.
+  - The same cycle in a page's font resource → that page `status="error"`, the next page normal, exit 3.
+- **SEC-17 [security]** A 4-page PDF whose third `/Kids` entry is dangling (`99 0 R`), resolves to a number, a string or `null`, is a dict with no `/Type` or with `/Type /Foo`, or repeats the second entry → `page-0003.xml` has `status="error"`, `bbox="0.00 0.00 0.00 0.00"` and a closed-vocabulary message; `page-0004.xml` holds page 4's text; pages 1 and 2 are normal; `document.xml` lists 4 pages; output validates; exit 3. A dangling first entry gives page 1 `status="error"`, pages 2 to 4 normal, exit 3.
 
 ## Invariants
 - **INV-1** Text conservation: the non-whitespace characters across a page's `word` elements equal, as a multiset, those pdfplumber reports for that page. Nothing is dropped or duplicated by table or nesting logic.
@@ -79,3 +85,4 @@ The user's request and answers in this session, and `parser-evaluation.md`.
 - 2026-11-05, iteration 1: first draft, after the switch from pdf.js to pdfplumber.
 - 2026-11-05, iteration 1: approved at the gate with the recommended defaults: AC-14 nesting rule, AC-21 and AC-23 confirmed.
 - 2026-11-05, iteration 1: SEC-1 to SEC-15 added from the threat model. AC-9 reworded after fixture K showed its fixture isn't how real RTL PDFs are laid out; the user chose to ship without bidi reordering as a known limit. Both approved at the design gate.
+- 2026-11-05, iteration 1 Integrate: the user approved the architect's page-tree walker delta (`iterations/01a/architect-delta.md`). SEC-16 and SEC-17 added; SEC-8 and SEC-14 extended. AC-18 now names its accepted exceptions, AC-1 the unflagged short tree (user chose no flag), AC-19 the K flip3 case. AC-17 records the whitespace rule the user kept.
