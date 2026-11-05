@@ -1,10 +1,7 @@
 """The skeleton's stand-ins for later slices. Each later slice replaces its own tests here."""
 
-import pytest
-
-from builders import make_chars
 from pdftext.borderless import detect_text_table
-from pdftext.grids import build_forest, collapse, make_grid, populate
+from pdftext.grids import collapse
 from pdftext.model import BBox, Figure, Line, Region, Table, Word
 from pdftext.reading_order import order_blocks
 
@@ -12,22 +9,6 @@ from pdftext.reading_order import order_blocks
 def line_at(x, y, text="w"):
     box = BBox(x, y, x + 10, y + 10)
     return Line(box, (Word(box, text, 0),), 0)
-
-
-def test_build_forest_finds_no_tables_yet():
-    assert build_forest((((BBox(0, 0, 10, 10)),),), max_depth=16) == ()
-
-
-def test_populate_leaves_every_char_and_figure_free():
-    chars = make_chars("ab")
-    figures = (Figure(BBox(0, 0, 1, 1)),)
-
-    assert populate((), chars, figures) == ((), chars, figures)
-
-
-def test_make_grid_is_not_built_yet():
-    with pytest.raises(NotImplementedError):
-        make_grid((BBox(0, 0, 10, 10),))
 
 
 def test_collapse_finds_nothing_to_collapse_yet():
