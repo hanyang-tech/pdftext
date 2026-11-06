@@ -3,8 +3,8 @@
 - **Branch:** `sdlc/pdf-layout-xml` (base: `main`; both unborn until the first commit)
 - **Iteration:** 5 of max 5
 - **Lanes:** iteration 2: lanes a, b, c merged (`3903359`, `2709725`, `7dd2585`); worktrees removed. Iteration 3: design delta `372a95f`; lanes c, b, a merged as `5349f46`, `f4d8d18`, `3881fe6`; worktrees removed at Integrate. Iteration 4: lanes a and b merged (`c04dbf3`, `5ff6a0f`). Iteration 5: lane a merged as `95f89f6`; worktree removed.
-- **Phase:** Release gate (from 2026-11-06 19:15Z). Both release reviews APPROVED on the whole branch, `release.md` written. Waiting on the user to confirm PAT-5 and approve the push and PR
-- **Gates:** requirements ✅ approved 2026-11-05 · design ✅ approved 2026-11-05 · release ⏳ asked 2026-11-06 19:15Z
+- **Phase:** Released as a PR. Both release reviews APPROVED; the user confirmed PAT-5 and approved the push
+- **Gates:** requirements ✅ approved 2026-11-05 · design ✅ approved 2026-11-05 · release ✅ approved 2026-11-06
 - **Mode:** interactive · verify: auto
 
 ## Checks
@@ -57,6 +57,7 @@ All through `uv run`, all passing on `95f89f6`. The full suite (1304 tests) take
 | PAT-2 | must | `src/pdftext/adapter.py` (user-confirmed it. 1) | import-scanning test | confirmed |
 | PAT-3 | must | `src/pdftext/text.py` (user-confirmed it. 1) | review only | confirmed |
 | PAT-4 | must | `src/pdftext/xmlwriter.py` (user-confirmed it. 1) | AC-22 test | confirmed |
+| PAT-5 | must | `src/pdftext/adapter.py` `_bounded_streams` and the decode-filter table (user-confirmed at Release) | review; seam tests | confirmed |
 
 ## Acceptance criteria and invariants
 Verified by the full-suite run on `3881fe6` (iteration 3 merged), 981 tests. Rows from iterations 1 and 2 pass again here:
@@ -145,3 +146,4 @@ Verified by the full-suite run on `3881fe6` (iteration 3 merged), 981 tests. Row
 - 2026-11-06 Iteration 5 integrated: lane a squashed as `95f89f6`, worktree removed; README Threads line for `hard_stop=True`. Full suite 1304 passed, 1 skipped in 103 s, coverage 99%, scanners clean. 48 of 48 rows ✅; #63 and #64 done. Retro DECISION: RELEASE (1 h 48 min). Release re-run starts.
 - 2026-11-06 Release re-run from 18:56Z on `51a3f21`: final reviewer (code-reviewer, opus) and security reviewer (general-purpose, opus) launched on `git diff 8e6166f...HEAD -- . ':!docs/sdlc'`, reports `release/final-review-2.md` and `release/security-2.md`. Full suite reused from Integrate (code unchanged since `95f89f6`).
 - 2026-11-06 Release re-run results: final reviewer APPROVED (2 MINORs: README overclaim → #67, `nan` with `setitimer` → #38's row; PAT-5 followed with the `_open_pdf` reset noted), security reviewer APPROVED with no findings (20 of 22 threat rows tested, 17 and 22 accepted; U1 to U3 → #68). No BLOCKER, so no skeptics. Completeness: 45 + 3 criteria, 20 + 2 abuse cases, 10 of 10 lanes, 66 reports, 0 send-backs. `release.md` written. Gate asked at 19:15Z: PAT-5 and the push.
+- 2026-11-06 Release gate: the user confirmed PAT-5 with the reset-per-open form allowed (added to `docs/patterns.md`) and approved pushing `main` at `8e6166f` and the branch, and opening the PR.

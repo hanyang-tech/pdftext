@@ -30,6 +30,14 @@ How code in this project is built. `must` patterns are rules; `should` patterns 
 - **Exemplar:** `src/pdftext/xmlwriter.py`
 - **Check:** the AC-22 test
 
+### PAT-5 Seams into third-party internals are per-thread and installed once (must)
+- **Rule:** a seam that replaces a function or table inside a third-party library is installed once, at import of the adapter, and never swapped at run time. It reads its settings only from a `threading.local`. A context manager sets that state around a call and restores it afterwards. The alternative is per-thread state that the opening call resets for every file. With no state set, the seam behaves as the library's original.
+- **Applies to:** the adapter, wherever it reaches into `pdfminer`, `pdfplumber` or `pypdfium2` internals
+- **Why:** conversions run on several threads at once, each with its own limits. Patching and unpatching around a call would race between threads and leak one run's limits into another.
+- **Exemplar:** `_bounded_streams` and the decode-filter table in `src/pdftext/adapter.py`. The encryption record, reset in `_open_pdf`, is the reset-per-open form.
+- **Check:** review; `tests/test_stream_limit.py::TestTwoRunsAtOnce`, `TestTheLimitIsRestored` and `tests/test_decode_filters.py::TestTheSeam` for the decode filters
+
 ## Changes
 - 2026-11-05: PAT-1 to PAT-4 added, confirmed by the user at the requirements gate of pdf-layout-xml.
 - 2026-11-05: exemplars for PAT-1 to PAT-4 set from iteration 1 of pdf-layout-xml, confirmed by the user.
+- 2026-11-06: PAT-5 added, confirmed by the user at the release gate of pdf-layout-xml, with the reset-per-open form allowed.

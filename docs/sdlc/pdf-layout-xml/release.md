@@ -79,7 +79,7 @@ All 48 rows pass on `95f89f6`. The full suite there gave 1304 passed and 1 skipp
 ## Design notes
 - **pdfplumber, not pdf.js** (`parser-evaluation.md`). The project started in TypeScript. pdfplumber won on what this work needs: table finding from both ruling lines and filled rectangles, char-level boxes, and form XObject transforms. The cost is Python 3.13.
 - **Own page-tree walker** (`adapter.py` `_walk_pages`, `_walk_tree`). A bad `/Kids` entry becomes that page's error, not the end of the run. pdfminer's walker drops or raises.
-- **Five private seams into pdfminer and pdfplumber.** These are the decode-filter table, `_bounded_streams`, the `render_char` char budget, the encryption record, and the logging handlers. Each is installed once at import and reads a `threading.local`, so a thread with no limit gets pdfminer's originals. The seams depend on pdfminer.six and pdfplumber internals, which `uv.lock` pins. `pip install .` doesn't pin them (#51). This is candidate pattern PAT-5, awaiting your confirmation.
+- **Private seams into pdfminer and pdfplumber (PAT-5).** These are the nine decode filters with `_bounded_streams`, the `render_char` char budget, and the encryption record. Each is installed once at import and reads a `threading.local`, so a thread with no limit gets pdfminer's originals. The seams depend on pdfminer.six and pdfplumber internals, which `uv.lock` pins. `pip install .` doesn't pin them (#51).
 - **PDFium only for repair, on one worker thread.** pdftext never calls PDFium for encrypted input, over-limit input, or a file that opens normally. A stopped caller abandons its job, and the job's result is discarded.
 - **Linear ASCII85 strip.** Under a limit, pdfminer's quadratic marker regexes are replaced by an equivalent linear strip. It matched them on every input up to length 6 and on 200,000 random inputs.
 - **SIGALRM alarm for `hard_stop=True` on the main thread.** The CLI is the only default user. The alarm makes a signal-checking C call stop at its deadline with the normal page error. The run owns SIGALRM: it restores the host's previous handler but cancels the host's timer. The first expiry is capped at one day (`ALARM_MAX_S`), because `setitimer` refuses longer values on macOS.
@@ -118,14 +118,14 @@ Manual check, not automated (#66): run a PDFium repair on the worker thread with
 
 ## SDLC Fast run report
 
-**Status:** ✅ Ready to release (pending your PAT-5 confirmation and push approval)
+**Status:** ✅ Ready to release
 **Branch:** `sdlc/pdf-layout-xml` · **Iterations:** 5 · **Lanes:** 10 slices in total, at most 3 in parallel · **Artifacts:** `docs/sdlc/pdf-layout-xml/`
 
 ### Patterns and standards
 - **Patterns:**
   - PAT-1 to PAT-4 (`must`, user-confirmed in iteration 1) were followed in every slice, per both release reviews.
-  - PAT-5 is a candidate: import-time seams that read a `threading.local`, with exemplars `_bounded_streams` and the decode-filter table in `src/pdftext/adapter.py`.
-  - The final review notes one deviation from PAT-5: the encryption record is reset in `_open_pdf`, not set by a context manager. The record is still per thread.
+  - PAT-5 (`must`) was captured in this run and confirmed by the user at the release gate: import-time seams that read a `threading.local`. Exemplars are `_bounded_streams` and the decode-filter table in `src/pdftext/adapter.py`. The user also allowed the reset-per-open form, which covers the encryption record that `_open_pdf` resets.
+  - Both release reviews found PAT-5 followed.
 - **Languages:** Python 3.13, checked against `references/languages/python.md`. The tools that ran were `ruff format`, `ruff check` (with `S`), and `mypy --strict`.
 
 ### Iterations
@@ -160,7 +160,7 @@ Manual check, not automated (#66): run a PDFium repair on the worker thread with
 | Criteria verified by a named test that passes on the final commit | 45 | 45 | |
 | Invariants verified | 3 | 3 | |
 | Abuse cases with a criterion and a test | 22 | 20 | Rows 17 and 22 accepted with no test |
-| Patterns that applied, with a reviewer or verifier result in every slice | 4 | 4 | PAT-5 awaits confirmation |
+| Patterns that applied, with a reviewer or verifier result in every slice | 5 | 5 | PAT-5 confirmed at the release gate |
 | Lanes with every phase section and a completeness table | 10 | 10 | |
 | Agent reports on disk, against agents launched | 66 | 66 | 62 in lane and design folders, 4 in `release/` |
 | Reports sent back for a missing contract section | — | 0 | |
