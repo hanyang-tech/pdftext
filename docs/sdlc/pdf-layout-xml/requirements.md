@@ -57,7 +57,12 @@ Fixture names refer to `spike/fixtures/`. Coordinates are points, with a top-lef
 - **SEC-4 [security]** Exceeding `--max-memory-bytes` → one-line error, exit 2, no `document.xml`. The library raises `LimitExceededError`.
 - **SEC-5 [security]** A file over `--max-file-bytes` is refused before the parser opens it. `/Count` over `--max-pages` is refused before any page is read. More real pages than a falsely small `/Count` declares stop at the limit. All exit 2 with no `document.xml`.
 - **SEC-6 [security]** A page with more characters than `--max-chars-per-page` → that page has `status="error"`, other pages are normal, exit 3.
-- **SEC-7 [security]** 40 tables nested inside each other → output validates, table depth is at most 16, INV-1 holds.
+- **SEC-7 [security]** 40 tables nested inside each other, built three ways, each with `--max-table-depth 16`:
+  - floating, each inside a cell of the one before;
+  - edge-to-edge, each a grid touching its parent cell's borders, so that `collapse` infers the levels;
+  - floating, with three aligned lines of two columns in the innermost kept cell.
+
+  In each case the output validates, every chain of nested `table` elements (inferred and text-detected ones included) is at most 16 deep, and INV-1 holds. Fixture B with `--max-table-depth 1` gives one flat table with spans and no `inferred` attribute.
 - **SEC-8 [security]** Every `message` matches the closed vocabulary, even when the exception text holds markup. An input filename with ESC and a newline gives exactly one stderr line with no control characters. A PDF whose `/Info` has a key holding ESC and a newline with an undecodable value (`/Evil#1b#5B31m#0AFAKE 5 0 R`, `5 0 obj << /A 5 0 R >>`) gives exit 0 and empty stderr, and a `/Page` with no MediaBox adds nothing to stderr. Nothing logged by the `pdfminer` or `pdfplumber` loggers reaches stderr or a handler on the root logger.
 - **SEC-9 [security]** A planted symlink at `out/page-0001.xml`, `out/document.xml` or `out/.page-0001.xml.tmp` → the link's target is unchanged and the output is correct.
 - **SEC-10 [security]** A run that fails, with an old `document.xml` in the output directory → no `document.xml` afterwards, and no stale `page-*.xml` from a larger earlier run.
@@ -66,12 +71,21 @@ Fixture names refer to `spike/fixtures/`. Coordinates are points, with a top-lef
 - **SEC-13 [security]** A font with `/Encoding /../../../../etc/passwd` opens nothing outside pdfminer's CMap directory, and `pyproject.toml` requires `pdfminer.six>=20251107`.
 - **SEC-14 [security]** A page whose transforms overflow to infinity → that page has `status="error"` and its own `0 0 W H` bbox. A page whose MediaBox gives a non-finite width or height (`[0 0 <400-digit number> 100]` gives infinity; the same number as both x0 and x1 gives NaN) → that page has `status="error"` and `bbox="0.00 0.00 0.00 0.00"` in both its page file and `document.xml`. In both cases output validates, other pages are normal, exit 3.
 - **SEC-15 [security]** Encrypted, over-limit and normally parsing inputs never call pypdfium2 (spy test).
+  - Encrypted means a trailer pdfminer reads has a non-null `/Encrypt`, whatever it holds.
+  - An `/Encrypt` that is dangling, resolves to a number, misses `/R`, `/O`, `/U` or `/P`, or comes with `/ID 7` or `/P /X` gives `input is password-protected` and exit 2.
+  - A file with an empty user password and no `/Root` gives `input is not a valid PDF` and exit 2.
+  - The same file whose first page-tree entry is dangling gives page 1 `status="error"` and exit 3.
 - **SEC-16 [security]** With `--page-timeout 1`:
   - A two-object reference cycle at `/Pages`, at the root's `/Kids` or at `/Count` → one stderr line and exit 2 within 3 s, no `document.xml` and no `page-*.xml`, pypdfium2 not called.
   - On a 4-page PDF, a cycle in page 3's `/Contents` or its `/Kids` entry, or `/MediaBox 99 0 R` with no object 99 → `page-0003.xml` has `status="error"`, `bbox="0.00 0.00 0.00 0.00"` and a closed-vocabulary message; pages 1, 2 and 4 hold their own text with no error; `document.xml` lists 4 pages; output validates; exit 3 within 3 s; `iter_pages` yields 4 pages, the third an error page.
   - The same cycle in page 1's `/Contents` → page 1 `status="error"`, pages 2 to 4 normal, exit 3, pypdfium2 not called.
   - The same cycle in a page's font resource → that page `status="error"`, the next page normal, exit 3.
 - **SEC-17 [security]** A 4-page PDF whose third `/Kids` entry is dangling (`99 0 R`), resolves to a number, a string or `null`, is a dict with no `/Type` or with `/Type /Foo`, or repeats the second entry → `page-0003.xml` has `status="error"`, `bbox="0.00 0.00 0.00 0.00"` and a closed-vocabulary message; `page-0004.xml` holds page 4's text; pages 1 and 2 are normal; `document.xml` lists 4 pages; output validates; exit 3. A dangling first entry gives page 1 `status="error"`, pages 2 to 4 normal, exit 3.
+- **SEC-18 [security]** PDFium concurrency and stops (threat row 20):
+  - Two threads each run `iter_pages` at once, 20 times, on two different damaged PDFs that need PDFium repair. Their pages equal a single-threaded run, and a spy on pypdfium2 records every call on one thread with no two calls overlapping.
+  - With the spy slowing repair to 2 s and `--page-timeout 1`, the CLI exits 2 within 2 s with exactly one stderr line, `pdftext: error: timed out reading the document structure`, and writes no page files.
+  - A second library thread whose repair is queued behind that slow one raises `LimitExceededError` within 1.5 s of its own start, with `page_timeout_s=1`.
+- **SEC-19 [security]** Per-thread stream limit (threat row 21): a PDF whose page 2 holds a content stream that inflates to 4 MiB, converted by two threads at once, one with `max_stream_bytes=1 MiB` and one with the default. The first gives page 2 `status="error"`; the second reads page 2 normally. Afterwards, a plain `zlib`-backed pdfminer decode of that stream on a third thread, with no pdftext call, returns all 4 MiB.
 
 ## Invariants
 - **INV-1** Text conservation: the non-whitespace characters across a page's `word` elements equal, as a multiset, those pdfplumber reports for that page. Nothing is dropped or duplicated by table or nesting logic.
@@ -86,3 +100,4 @@ The user's request and answers in this session, and `parser-evaluation.md`.
 - 2026-11-05, iteration 1: approved at the gate with the recommended defaults: AC-14 nesting rule, AC-21 and AC-23 confirmed.
 - 2026-11-05, iteration 1: SEC-1 to SEC-15 added from the threat model. AC-9 reworded after fixture K showed its fixture isn't how real RTL PDFs are laid out; the user chose to ship without bidi reordering as a known limit. Both approved at the design gate.
 - 2026-11-05, iteration 1 Integrate: the user approved the architect's page-tree walker delta (`iterations/01a/architect-delta.md`). SEC-16 and SEC-17 added; SEC-8 and SEC-14 extended. AC-18 now names its accepted exceptions, AC-1 the unflagged short tree (user chose no flag), AC-19 the K flip3 case. AC-17 records the whitespace rule the user kept.
+- 2026-11-06, iteration 3 Design: the user approved the architect's delta for backlog #18, #20, #21 (`iterations/03/architect-delta.md`). SEC-7 now covers three nesting routes and every table level; SEC-15 defines "encrypted" and its malformed cases; SEC-18 and SEC-19 added for PDFium concurrency and the per-thread stream limit.

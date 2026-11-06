@@ -1,8 +1,8 @@
 # PDF layout XML: state
 
 - **Branch:** `sdlc/pdf-layout-xml` (base: `main`; both unborn until the first commit)
-- **Iteration:** 2 of max 5 (closed)
-- **Lanes:** iteration 2: lanes a, b, c merged (`3903359`, `2709725`, `7dd2585`); worktrees removed. Retro done: CONTINUE, iteration 3 starts at Design (#18, #20, #21), then lanes #4 and #7
+- **Iteration:** 3 of max 5
+- **Lanes:** iteration 2: lanes a, b, c merged (`3903359`, `2709725`, `7dd2585`); worktrees removed. Iteration 3: design delta for #18, #20, #21 approved; lane c (test-only part of #7) in fix round 2 in `pdf-layout-xml-03c` from `0ebb073` (reviewer r1 2 MAJOR on test strength, tester r1 PASS); lanes a (#7 limits with #20, #21, #9) and b (#4 with #18) being planned
 - **Gates:** requirements ✅ approved 2026-11-05 · design ✅ approved 2026-11-05 · release ⏳
 - **Mode:** interactive · verify: auto
 
@@ -86,15 +86,15 @@ Verified by the full-suite run on `7dd2585` (iteration 2 merged), 642 tests. Row
 | AC-19 | ✅ | `tests/test_repair.py::TestRefusedInput::test_gives_one_line_exit_two_and_no_document`, `TestFirstPageFault::test_exits_three_for_a_dangling_first_page_through_the_command` (it. 2a) |
 | AC-20 | ✅ | `tests/test_repair.py::TestEncryptedInput` (it. 2a) |
 | AC-21 | ✅ | `tests/test_repair.py::TestRepairThroughPdfium::test_a_broken_cross_reference_table_gives_the_output_of_the_undamaged_file` (it. 2a) |
-| SEC-7 | ✅ | `tests/test_tables.py::TestDeepNesting`, `TestDeepNestingOutput` (it. 2b) |
+| SEC-7 | 🟡 | floating route: `tests/test_tables.py::TestDeepNesting`, `TestDeepNestingOutput` (it. 2b). Reworded it. 3: edge-to-edge and text-detected routes and the `--max-table-depth 1` clause open until #4 |
 | SEC-8 | ✅ | `tests/test_page_failures.py::TestErrorMessages::test_a_message_names_only_the_exception_class_whatever_its_text_says`, `tests/test_parser_logging.py` (it. 2a) |
 | SEC-14 | ✅ | `tests/test_page_failures.py::TestNonFiniteGeometry`, `TestImageGeometry` (it. 2a) |
-| SEC-15 | 🟡 | `tests/test_repair.py::TestEncryptedInput::test_never_sends_encrypted_input_to_pdfium`, `TestRepairThroughPdfium::test_never_calls_pdfium_for_a_file_that_opens_normally` (it. 2a). Over-limit clause open until #7 |
+| SEC-15 | 🟡 | `tests/test_repair.py::TestEncryptedInput::test_never_sends_encrypted_input_to_pdfium`, `TestRepairThroughPdfium::test_never_calls_pdfium_for_a_file_that_opens_normally` (it. 2a). Over-limit clause and the it. 3 "encrypted" clauses open until #7 |
 | SEC-16 | 🟡 | dangling `/MediaBox` clause: `tests/test_page_failures.py::TestPageDictFaults::test_a_dangling_media_box_is_an_error_page_and_the_rest_are_read` (it. 2a). Cycle clauses open until #7 |
 | SEC-17 | ✅ | `tests/test_page_failures.py::TestPageTreeEntryFaults`, `tests/test_repair.py::TestFirstPageFault` (it. 2a) |
 | INV-2 | ✅ | `tests/test_tables.py::TestFixtures::test_keeps_every_child_inside_its_parent_or_marks_the_parent` (it. 2b) |
 
-AC-14 to AC-16 (#4), AC-23, AC-25, SEC-1 to SEC-6, SEC-12, SEC-13 and INV-3 (#7) are ⬜ open, with the open clauses of SEC-15 and SEC-16 (#7). See `requirements.md`.
+AC-14 to AC-16 (#4), AC-23, AC-25, SEC-1 to SEC-6, SEC-12, SEC-13, SEC-18, SEC-19 and INV-3 (#7) are ⬜ open, with the open clauses of SEC-7 (#4), SEC-15 and SEC-16 (#7). See `requirements.md`.
 
 ## Log
 - 2026-11-05 Parser decision changed from pdf.js to pdfplumber, with Python, at the user's condition. Evidence in `parser-evaluation.md`.
@@ -102,3 +102,6 @@ AC-14 to AC-16 (#4), AC-23, AC-25, SEC-1 to SEC-6, SEC-12, SEC-13 and INV-3 (#7)
 - 2026-11-05 Design approved. User chose to ship without RTL reordering (backlog #8). First commit `8e6166f`. `main` is still unborn and the remote is empty, which matters for the PR at Release.
 - 2026-11-05 Iteration 1 closed. The user approved the architect's page-tree walker delta, chose no flag for a short `/Count`, kept the whitespace rule, and confirmed the four exemplars. SEC-16 and SEC-17 added. The architect's first delta round ran `rm -rf big o_*` in the shared scratchpad; later rounds kept to their own subfolder.
 - 2026-11-05 Iteration 2 closed in 39 min, three lanes. 21 criteria rows verified, 642 tests. Driver decision: certificate and unsupported encryption handlers get the same `input is password-protected` line. Architect queue for iteration 3: #18, #20, #21.
+- 2026-11-06 Iteration 3 started at Design: architect delta for #18, #20, #21 (report `iterations/03/architect-delta.md`).
+- 2026-11-06 Architect delta READY (20 min): PDFium worker thread, `/Encrypt`-in-trailer rule, depth over every table level; SEC-7 and SEC-15 reworded, SEC-18 and SEC-19 proposed. Lane c started before the gate.
+- 2026-11-06 Design gate approved by the user. SEC-7 and SEC-15 reworded, SEC-18 and SEC-19 added in `requirements.md`; SEC-7 back to 🟡 for its new routes. Lane c in fix round 2 (two MAJOR test-strength findings).

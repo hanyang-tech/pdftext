@@ -19,7 +19,7 @@ convert:     iter_pages -> xmlwriter.render_page -> OutputDir.write; render_docu
 6. Otherwise order the container's lines, tables and figures with XY-cut. Consecutive lines in a leaf become a `region`.
 7. Set `overflow` where a direct child leaves its parent (INV-2), and set the status.
 
-A watchdog thread enforces time and memory limits from outside the stages. A bounded zlib shim inside the adapter enforces the stream limit.
+A watchdog thread enforces time and memory limits from outside the stages. A bounded zlib shim inside the adapter enforces the stream limit of the run on the calling thread. Every PDFium call runs on one worker thread the adapter owns.
 
 ## Components and files
 
@@ -27,7 +27,7 @@ A watchdog thread enforces time and memory limits from outside the stages. A bou
 |---|---|---|
 | C1 | `model.py`, `errors.py` | Frozen types and public exceptions |
 | C2 | `limits.py` | `Limits`, `Watchdog`, `peak_rss` |
-| C3 | `adapter.py` | Open, classify, repair, lazy page reads, bounded zlib. The only parser import |
+| C3 | `adapter.py` | Open, classify, repair on the PDFium worker, lazy page reads, bounded zlib, the encryption record. The only parser import |
 | C4 | `text.py` | `sanitize_chars`, `group_lines` |
 | C5 | `grids.py` | `make_grid`, `collapse`, `build_forest`, `populate` |
 | C6 | `borderless.py` | `detect_text_table` |
@@ -55,7 +55,8 @@ A watchdog thread enforces time and memory limits from outside the stages. A bou
 File-level notes for planning:
 - The skeleton slice writes the whole of `model.py`, the whole XSD and writer vocabulary, and `pipeline.py` in final form. It calls stubs with the final signatures: `build_forest` returns `()`, `detect_text_table` returns `None`, `order_blocks` sorts by `(y0, x0)`. The table, borderless and reading-order slices then change only their own stage file, so they can run in parallel.
 - The skeleton also writes `adapter.read_next` in full, including the rotation and frame maths, so the Unicode and rotation slice doesn't need to edit the adapter.
-- `collapse` lives in `grids.py`, so the edge-to-edge slice follows the ruled-table slice.
+- `collapse` lives in `grids.py`, so the edge-to-edge slice follows the ruled-table slice. That slice also edits `pipeline.py`, to pass each cell's depth to text-table detection (SEC-7).
+- The PDFium worker, the encryption record and the per-thread shim limit are all in `adapter.py`, so they go with the limits slice. Its README line on threads goes with it too.
 - The failure and limits slices both edit `adapter.open_document` and `api.py`, so limits follows failure.
 
 ## Contracts
@@ -97,7 +98,7 @@ def sanitize_chars(chars: tuple[RawChar, ...]) -> tuple[tuple[RawChar, ...], int
 def group_lines(chars: tuple[RawChar, ...]) -> tuple[Line, ...]
 # grids.py
 def make_grid(boxes: tuple[BBox, ...], *, inferred: bool = False) -> GridNode
-def collapse(grid: GridNode) -> GridNode | None
+def collapse(grid: GridNode, *, max_levels: int) -> GridNode | None
 def build_forest(grids: tuple[tuple[BBox, ...], ...], *, max_depth: int) -> tuple[GridNode, ...]
 def populate(forest: tuple[GridNode, ...], chars: tuple[RawChar, ...], figures: tuple[Figure, ...]
              ) -> tuple[tuple[GridNode, ...], tuple[RawChar, ...], tuple[Figure, ...]]  # forest, free chars, free figures
@@ -125,9 +126,17 @@ Algorithm constants and rules, as proved. Each is a named constant in its stage.
 - **`collapse`:**
   - Return `None` if the grid is plain or has holes.
   - Outer lines are the interior lines crossed by no cell. Require at least 2 outer columns and 2 outer rows, fewer than the unit grid.
-  - An outer cell with one member stays a leaf. With several members they become an `inferred` subgrid, which must be at least 2×2 and plain or itself collapsible.
-  - Any failure returns `None`, and the grid stays flat with spans.
-- **`build_forest`:** collapse-or-flat each grid. Sort by `(-area, bbox, input index)`. The parent is the smallest-area cell of any placed grid containing the bbox within 0.5 pt, otherwise the grid is a root. A table deeper than `max_depth` is discarded, so its text falls to the enclosing cell.
+  - An outer cell with one member stays a leaf. With several members they become an `inferred` subgrid, which must be at least 2×2 and plain or itself collapsible with `max_levels - 1`. That subgrid is the outer cell's only entry in `children`.
+  - Levels: a grid with no inferred subgrid has 1, and a collapsed grid has 1 plus the most levels among its inferred subgrids. A result with more than `max_levels` levels is a failure, so `max_levels < 2` always returns `None`. This bounds the recursion too.
+  - Any failure returns `None`, and the grid stays flat with spans. A collapse is all or nothing: never part of the levels.
+  - The result's bbox is the flat grid's, since the outer cells cover the same members.
+- **`build_forest`:**
+  - **Order:** `make_grid` each non-empty grid, flat, and sort by `(-area, bbox, input index)`. Collapsing keeps the bbox, so it can't change the order.
+  - **Depth:** every table level counts once, whether floating, inferred or text-detected. A root is at depth 1. An inferred subgrid, and a grid placed in a cell, is one deeper than the grid holding that cell.
+  - **Parent:** the smallest-area cell holding the bbox within 0.5 pt, among every cell of every placed grid, at every inferred level. A floating grid already placed in a cell is a placed grid, so its cells are candidates too. Ties go by the total key `(area, placement position, cell path)`, where the path is the cell and subgrid indexes down from that placed grid's top level, compared as tuples. So the earlier-placed grid wins, then the shallower cell. With no holding cell, the grid is a root.
+  - **Limit:** with `d` the depth the grid would take, `d > max_depth` drops it, so its text falls to the enclosing cell. Otherwise the grid is `collapse(flat, max_levels=max_depth - d + 1)`, or the flat grid with spans if that returns `None`. A grid whose collapse would pass the limit is kept flat, never dropped or cut.
+  - **Children order:** a cell's `children` hold its inferred subgrid, if any, first, then the grids placed in it, in placement order. `populate` takes the first child grid holding a char. So where a floating grid overlaps the inferred subgrid of the same outer cell, the overlap's chars go to the inferred subgrid. This happens only when the floating grid's bbox crosses inferred lines, and INV-1 holds either way.
+- **Text tables and depth:** `compose_page` passes each cell's depth down, and `detect_text_table` runs only in a leaf ruled cell, inferred ones included, whose depth is below `max_table_depth`. A text table can't hold a table, so the output's table depth never passes the limit.
 - **`populate`:** find a cell with bisect on `xs`, `ys`. A centre in a hole falls to the parent container. A figure goes to the deepest cell fully containing it within 0.5 pt, otherwise to the page.
 - **`detect_text_table`:**
   - All words must be rotation 0. Rows form by word mid-y within `0.3*height`, and there must be at least 3.
@@ -151,8 +160,22 @@ class Document:                                             # context manager
     def read(self) -> RawPage                               # read that entry's page; raises the entry's fault, if it had one
 ```
 
-- **Open:** check the size, install the bounded zlib shim, and call `pdfplumber.open(fp, unicode_norm=None, raise_unicode_errors=False)`. Then set `doc.caching = False`, read `/Count`, and take the first page-tree step, in that order. `/Count` goes first because a stop caught in page 1's entry (below) would otherwise leave a `/Count` cycle running after it, and SEC-5 needs `/Count` before any page anyway.
-- **Classify a failure:** `PDFEncryptionError` (a wrong password, and a security handler pdfminer doesn't support, such as `/Adobe.PubSec` or an unknown `/V`) gives `EncryptedPdfError`, with the line `input is password-protected`. A too-large stream gives `LimitExceededError`. Anything else goes to PDFium repair in memory (`PdfDocument`, `save(BytesIO)`, reopen). `PdfiumError` gives `InvalidPdfError`, and so does zero pages. An ordinary exception in the first page-tree entry also tries repair, keeping the original open. If the repaired document's first entry is good, it is used. If not, because PDFium fails or the repaired first entry fails too, the original is used, with page 1 as an error page (Decisions). A stop in the first entry is never repaired. `repair=True` must never be used, since it runs Ghostscript. A watchdog stop is a `BaseException`, so it passes the classifier and pdfplumber's `except Exception`, and never reaches PDFium.
+- **Open:** check the size, set this thread's stream limit for the zlib shim, clear this thread's encryption record, and call `pdfplumber.open(fp, unicode_norm=None, raise_unicode_errors=False)`. Then set `doc.caching = False`, read `/Count`, and take the first page-tree step, in that order. `/Count` goes first because a stop caught in page 1's entry (below) would otherwise leave a `/Count` cycle running after it, and SEC-5 needs `/Count` before any page anyway.
+- **Encryption record:** when `adapter.py` is imported, it wraps `PDFDocument._initialize_password` once, process-wide (Risk 6). The wrapper records on a `threading.local`, for the open in progress on that thread, `declared` on entry and `handler_ok` on normal return, then returns or re-raises exactly as pdfminer would. pdfminer calls it for every trailer it reads with a non-null `/Encrypt`, before it reads any key of the dictionary, so a dangling, non-dict or incomplete `/Encrypt` is recorded too. Input is **encrypted** when the record says `declared`. `/Encrypt null` counts as absent, as in the PDF spec. The record is cleared before each `pdfplumber.open`, the repaired copy's included.
+- **Classify a failure:**
+  - Encrypted and `handler_ok` not set: `EncryptedPdfError`, with the line `input is password-protected`. This is a wrong password, a security handler pdfminer doesn't support (such as `/Adobe.PubSec` or an unknown `/V`), a dangling or non-dict `/Encrypt`, and a dictionary whose `/R`, `/O`, `/U`, `/P` or `/ID` is missing or malformed, which pdfminer reports as `KeyError`, `IndexError` or `struct.error`. A `PDFEncryptionError` with no record can't happen, and maps the same way.
+  - Encrypted and `handler_ok` set, then a later failure, such as a damaged file with only an owner password: `InvalidPdfError`, with `input is not a valid PDF`, and no repair.
+  - A too-large stream gives `LimitExceededError`.
+  - Anything else goes to PDFium repair in memory (`PdfDocument`, `save(BytesIO)`, reopen), on the PDFium worker below. `PdfiumError` gives `InvalidPdfError`, and so does zero pages.
+  - An ordinary exception in the first page-tree entry also tries repair, keeping the original open, unless the input is encrypted: then page 1 is an error page and PDFium isn't called. If the repaired document's first entry is good, it is used. If not, because PDFium fails or the repaired first entry fails too, the original is used, with page 1 as an error page (Decisions). A stop in the first entry is never repaired.
+  - `repair=True` must never be used, since it runs Ghostscript. A watchdog stop is a `BaseException`, so it passes the classifier and pdfplumber's `except Exception`, and never reaches PDFium. A cycle at `/Encrypt` spins in pdfminer before the wrapper is called, so the stop ends the run (threat row 18).
+  - Not detected: input whose `/Encrypt` sits in a trailer pdfminer never reads, such as an xref-stream file with a broken `startxref`, whose fallback reads only classic `trailer` dictionaries. It goes to repair like any damaged file. The record keeps honest encrypted files away from PDFium; a crafted file can always omit `/Encrypt`, so this isn't a defence against PDFium exploits (threat row 16, Risk 8).
+- **PDFium worker:** every pypdfium2 call (`PdfDocument`, `save`, `close`) runs on one daemon thread that the adapter starts on the first repair and keeps for the process. A caller puts a job (the input bytes, a sink, a done `Event`) on the worker's queue and waits with `Event.wait(0.05)` in a loop. So a watchdog stop lands in the caller's wait, never inside PDFium or pypdfium2's ctypes write callback, which swallows it (Decisions).
+  - A caller that is stopped marks its job abandoned and lets the stop propagate. The worker skips an abandoned job that hasn't started. If the job is running, its sink drops further writes, so `save` ends quickly, and the result is discarded. A repaired copy is used only by a caller that saw the job finish.
+  - The worker catches `Exception` per job and hands it back to the caller, so `PdfiumError` gives `InvalidPdfError` as above. Nothing delivers async exceptions to the worker: the watchdog targets the thread that armed it.
+  - PDFium calls therefore never overlap, from any number of threads, and are serialised without a lock that a stopped thread could wait on or hold.
+  - At interpreter exit, a handler registered after pypdfium2 is imported runs before pypdfium2's own `destroy_lib`, because `atexit` runs handlers last-in first-out. It refuses new jobs, abandons queued ones, and waits up to `PDFIUM_EXIT_WAIT_S = 2.0` for a running one (Risk 12).
+- **Bounded zlib shim:** installed once, when `adapter.py` is imported, and never removed. It reads its limit from a `threading.local`. `open_document`, `advance` and `read` each set it from their `Limits` on entry and restore the previous value on exit, so each run, the repaired copy's `_start` included, gets its own limit. On a thread with no limit set, such as a host's own pdfminer use, it decompresses without a bound, as zlib would.
 - **Page-tree walk:** the adapter's own `_walk_pages(doc)` replaces `PDFPage.create_pages`, and yields one `_Entry(page_object | None, failure | None)` per leaf of `/Kids`, depth first from the catalog's `/Pages`:
   - Each `/Kids` entry is handled inside one `try ... except (Exception, StructureTimeout)`. Resolve it and require a dict. An object ID already visited is a failure. Copy down the inheritable `/Resources`, `/MediaBox`, `/CropBox` and `/Rotate`. Then, by `/Type` (or a lowercase `type`, as pdfminer accepts): `/Pages` resolves its `/Kids`, requires a list and pushes the children; `/Page` builds `PDFPage(doc, objid, attrs, None)`; anything else raises `PageEntryError`, an ordinary exception private to the adapter.
   - A caught exception becomes that entry's failure. An entry that is a `/Pages` node and fails becomes one failed entry for its whole subtree.
@@ -212,7 +235,8 @@ __all__ = iter_pages, convert, render_page, render_document, Limits, DEFAULT_LIM
 - **Error page:** `error_page(document.page_number, document.page_bbox, message)`, with no blocks. `page_bbox` is the page's own box if that is known and finite, otherwise `BBox(0, 0, 0, 0)`, written as `0.00 0.00 0.00 0.00`. The `document.xml` entry takes the same value from `Page.bbox`, so neither file can hold `inf` or `nan`.
 - `message` is closed vocabulary: `page processing failed: <ExceptionClass>`, `page processing timed out`. It never holds PDF strings, addresses or paths.
 - **Parser logging:** when `adapter.py` is imported, it attaches `logging.NullHandler()` and sets `propagate=False` on the `pdfminer` and `pdfplumber` loggers, whose warnings quote names from the PDF. This stops both `logging.lastResort` writing to stderr and a host application's root logger receiving them.
-- `hard_stop=True` lets the watchdog write one line and call `os._exit(2)` if the thread hasn't responded within the grace period. Only the CLI sets it. Library callers accept that a C-level hang can't be interrupted.
+- `hard_stop=True` lets the watchdog write one line and call `os._exit(2)` if the thread hasn't responded within the grace period. Only the CLI sets it. Library callers accept that a C-level hang can't be interrupted. A hang inside the PDFium worker doesn't hold the caller, who is stopped at its deadline as usual, but it blocks every later repair in that process (Risk 12).
+- **Threads:** `iter_pages` and `convert` may run on several threads at once, each with its own `Limits`, watchdog and stream limit. One `iter_pages` generator must not be advanced from two threads at once. pdftext serialises only its own PDFium calls, so a host that also calls pypdfium2 on another thread isn't covered. The README's library section states these three points.
 - `convert` writes through `OutputDir`:
   - `prepare()` makes the directory and unlinks `document.xml` and `page-*.xml` before the input is opened.
   - `write(name, data)` creates `.<name>.tmp` with `O_CREAT|O_EXCL|O_WRONLY` after unlinking any stale one, then calls `os.replace`.
@@ -284,6 +308,11 @@ There's no namespace. Text appears only in `word`. Optional attributes are absen
 | Order inside open | `/Count`, then the first page-tree step | The first step first (today's code) | With a watchdog that fires once per arm, page 1's entry caught the stop, and a `/Count` cycle then spun unguarded until the 1.5 s test backstop. With `/Count` first, the run ended in 0.21 s. Re-delivering the stop until `disarm` covers the same gap. SEC-5 needs `/Count` before any page too |
 | Bbox when the page's own isn't usable | `BBox(0, 0, 0, 0)` | Clamp to a maximum, or omit the bbox | The XSD accepts it on `page` and in `document.xml`, and `inf` fails. PAT-1 requires a bbox, and `status="error"` tells the reader not to rely on it |
 | Parser log output | `NullHandler` and `propagate=False` on both loggers | Sanitising log records, or raising the level | Took the hostile metadata case from 111 bytes of stderr, with ESC and a newline, to 0. A host that wants these logs can attach its own handler to those loggers |
+| Depth of collapsed grids | Every level counts toward `max_depth`, inferred and text-detected ones too. `collapse` gets the levels left, and a grid whose collapse won't fit stays flat | Count a collapsed grid as one level (the it. 2b code). Drop the whole grid. Keep the outer levels and cut the deeper inferred ones | One level per grid lets the output pass SEC-7's limit, and the collapse recursion has no bound but the grid's size. Dropping loses the ruled structure the flat form keeps. A cut leaves a partly collapsed grid, which isn't AC-14's "plain grid" and needs more code. Flat with spans is what `collapse` already returns on any failure |
+| Parent of a floating grid | Smallest cell at any level of a placed grid, inferred levels included, key `(area, placement position, cell path)` | Top-level cells only (the it. 2b code) | A table inside an inferred cell would land in the outer cell, beside the inferred subgrid. The key reduces to the it. 2b key `(area, grid, cell)` while `collapse` returns `None`, so no current test changes |
+| PDFium and threads | One worker thread for all PDFium calls. Callers wait by polling an `Event` | A module-level lock around `PdfDocument`, `save` and `close`. A documented "not thread-safe" limit only | Probes `probe_pdfium_stop.py` and `probe_pdfium_stop2.py` (iteration 3 architect delta): a stop delivered inside `save` lands in pypdfium2's ctypes write callback, which prints "Exception ignored" and a traceback to stderr and returns a truncated copy (2,011,963 of 2,044,731 bytes) with no exception. That breaks SEC-8's one line, with or without threads, once the watchdog arms over repair. A thread stopped while waiting on a held `Lock` wasn't stopped until the lock was free (1.96 s of a 2 s hold); a polled `Event.wait(0.05)` was stopped in 0.21 s. A lock keeps both faults. A documented limit leaves the crash to users and keeps the callback fault |
+| Stream limit across threads | Per-thread limit read by one shim | Process-wide limit (Risk 6 before it. 3) | Two runs with different limits weakened each other's bound. A `threading.local` costs nothing and also covers the repaired copy's `_start` |
+| What "encrypted" means | A non-null `/Encrypt` in a trailer pdfminer reads, recorded by a wrapper on `PDFDocument._initialize_password` | `PDFEncryptionError` only (it. 2a). A byte scan for `/Encrypt`. Re-parsing a failed file with a `PDFDocument` subclass. Reading the failed constructor's frame from the traceback | Probes `probe_encrypt.py` and `probe_encrypt_seam.py`: a missing `/R`, `/O`, `/U` or `/P` raises `KeyError`, a bad `/ID` `IndexError`, a name for `/P` `struct.error`, and each reached PDFium. The wrapper recorded every one of 11 declaring cases and none of 3 others, including `/Encrypt null`, with no second parse. A byte scan misreads `#xx` name escapes, strings and streams. A re-parse doubles open time for damaged files, which Risk 9 shows can reach the 30 s limit. Frame reading depends on pdfminer's code layout more than one method name does |
 
 - 2026-11-05, it. 1 (driver): Risk 1 confirmed by test, not just reasoning. Fixture K, a real CoreText PDF, reads as `Hello 123 ملاعلاب ابحرم` through pdfplumber. The user chose at the design gate to keep no reordering and ship this as a known limit (backlog #8). No contract, data model, trust boundary or dependency affected.
 - 2026-11-05, it. 1 (driver): slice order set. The skeleton also carries `sanitize_chars` and its AC-24 test, and `OutputDir` with SEC-9 to SEC-11, because those are in the files it writes in final form. SEC-7 goes with `build_forest`, SEC-8, SEC-14 and SEC-15 with the failure slice. No contract affected.
@@ -294,6 +323,9 @@ There's no namespace. Text appears only in `word`. Optional attributes are absen
 - 2026-11-05, it. 1 Integrate (driver): which size sets each threshold in `group_lines` (`01a/reviewer-r1.md` U13), settled as the code has it. The baseline tolerance uses the first char of the cluster, the word gap the previous non-space char, and the line gap the last char of the line so far. Each compares against a char already placed, so the result doesn't depend on a later char. No contract affected.
 - 2026-11-05, it. 2a (driver): from `02a/reviewer-r1.md` #1. Encrypted input is classified by pdfminer's base `PDFEncryptionError`, not only `PDFPasswordIncorrect`, so certificate and unsupported handlers also stay away from PDFium (SEC-15, threat row 16). They get the same `input is password-protected` line and exit 2: to the user the file can't be read without a key either way, and a new message would add an output case no criterion asks for. No contract, data model or dependency affected; the trust boundary is enforced as already written.
 - 2026-11-05, it. 2a (driver): from `02a/reviewer-r1.md` #2 and its design issue 2. PDFium isn't thread-safe according to pypdfium2, and repair calls it from the public library API. Not a threat-model row yet: the architect decides with #7 between a process-wide lock and a documented "not thread-safe" limit, next to Risk 6's process-wide zlib shim (backlog #20).
+- 2026-11-06, it. 3 (architect): from backlog #18 (`02b/reviewer-r1.md` #1), prompted by #4 making `collapse` real. Every table level now counts toward `max_depth`, inferred and text-detected ones included. `collapse` takes `max_levels` and is all or nothing, so a grid whose collapse won't fit stays flat with spans. A floating grid's parent is searched among cells at every inferred level, with the total tie key `(area, placement position, cell path)`. `collapse`'s signature changes; `GridNode` doesn't. Text-table detection is limited by depth in `pipeline.py`, outside #4's listed files. SEC-7's wording is proposed for revision. No data model, XML vocabulary or dependency change.
+- 2026-11-06, it. 3 (architect): from backlog #20 (`02a/reviewer-r1.md` #2), prompted by probes showing that a watchdog stop inside PDFium's `save` is swallowed by pypdfium2's ctypes callback, printed as a traceback and leaves a truncated copy, and that a thread waiting on a lock can't be stopped. All PDFium calls move to one adapter-owned worker thread, and the zlib shim's limit becomes per thread, which removes Risk 6's concurrency caveat. The library is now documented as safe across threads, with one generator per thread. New Risk 12, threat rows 20 and 21, SEC-18 and SEC-19 proposed. The README line is outside #7's listed files. No public signature, exit code or XML change.
+- 2026-11-06, it. 3 (architect): from backlog #21 (`02a/reviewer-r2.md` #4), prompted by the it. 2a classification note. "Encrypted" now means a non-null `/Encrypt` in a trailer pdfminer reads, recorded by a wrapper on `PDFDocument._initialize_password` (a new private seam, Risk 6). Such input never reaches PDFium: a failed security handler gives `input is password-protected`, a later failure gives `input is not a valid PDF`, and a failed page 1 gives a page-1 error page. This replaces the it. 2a rule, which let `KeyError`, `IndexError` and `struct.error` from a malformed `/Encrypt` reach PDFium. Trust-boundary change: damaged owner-password-only files lose PDFium repair (Risk 13). SEC-15's wording is proposed for revision. No public signature or XML change.
 
 Dependencies: `pdfplumber>=0.11.10,<0.12`, `pdfminer.six>=20251107`, `pypdfium2`, locked by `uv.lock`. Dev: pytest, pytest-cov, ruff, mypy, pip-audit, lxml. `pip-audit` on the locked set (pdfplumber 0.11.10, pdfminer.six 20260107, pypdfium2 5.14.0, Pillow 13.0.0, cryptography 50.0.2) found nothing.
 
@@ -304,15 +336,15 @@ Dependencies: `pdfplumber>=0.11.10,<0.12`, `pdfminer.six>=20251107`, `pypdfium2`
 3. **Page-level borderless tables and tables of contents read column by column.** This is by design (AC-5, AC-16).
 4. **The async exception can land anywhere in Python code.** `disarm` clears a pending one, and the boundary catches a late delivery. pdfminer's state survived a mid-page stop in testing, but a stop inside shared parser state could misparse a later page of the same file. A hostile PDF can only harm its own output this way.
 5. **Hard to reverse:** the XML vocabulary, once consumers exist. `schema-version` is there for this.
-6. **Private seams:** the `pdfminer.pdftypes.zlib` shim, direct `Page` construction, and the page-tree walker. All are pinned by the lock and confined to the adapter. The shim is process-wide, so concurrent runs with different stream limits aren't supported. The walker relies on these pdfminer internals:
+6. **Private seams:** the `pdfminer.pdftypes.zlib` shim, the `PDFDocument._initialize_password` wrapper, direct `Page` construction, and the page-tree walker. All are pinned by the lock and confined to the adapter. The shim and the wrapper are installed process-wide, but each reads or writes only a `threading.local`, so concurrent runs keep their own stream limits and encryption records, and a host's own pdfminer use behaves as without pdftext. The wrapper relies on pdfminer calling `_initialize_password` once per trailer with a non-null `/Encrypt`, before reading the dictionary. The walker relies on these pdfminer internals:
    - `PDFPage(doc, objid, attrs, label)` and `PDFPage.INHERITABLE_ATTRS`;
    - `LITERAL_PAGE` and `LITERAL_PAGES`;
    - `doc.catalog`, `doc.xrefs` with `get_objids()`, and `doc.getobj`;
    - `resolve1` and `PDFObjRef.objid`.
 
-   A pdfminer upgrade must re-run the walker's tests and a page-for-page comparison with `create_pages` on the fixtures.
+   A pdfminer upgrade must re-run the walker's tests and a page-for-page comparison with `create_pages` on the fixtures, and the malformed-`/Encrypt` tests.
 7. **pdfplumber's bbox uses MediaBox, not CropBox,** so text outside the crop is reported, and a single boxed rectangle becomes a 1×1 table. No criterion covers either.
-8. **PDFium is memory-unsafe C on untrusted bytes, in-process.** It's used only on the fallback path. This is residual risk, not removed.
+8. **PDFium is memory-unsafe C on untrusted bytes, in-process.** It's used only on the fallback path, on one worker thread. This is residual risk, not removed. Keeping encrypted input away from PDFium doesn't reduce it against a crafted file, which can simply omit `/Encrypt`.
 9. **`--page-timeout` now also limits opening.** A large damaged file can be refused with exit 2 where a page error might be expected, and raising the flag cures it. pdfminer's fallback took 15 s for open plus the first page-tree step on 256 MiB of dense text, and 5.6 s on 256 MiB of binary. Scaled linearly, which wasn't measured, that is about 60 s and 22 s at the 1 GiB file limit, so only dense-text damaged files above roughly 500 MiB are refused at the default. Healthy files stayed far below the limit: 0.65 s to open a 1M-object file, and at most 60 ms for any page-tree step across 10,000 pages.
 10. **Some page-tree faults still lose later pages, or shift their numbers.** A fault in one entry is a page error. AC-18's "every other page is written normally" still fails in these cases:
     - A stop or parse error in the root `/Pages` or its `/Kids` array, or in the xref fallback's object parsing, ends the run with exit 2. A cycle there ends it the same way.
@@ -322,6 +354,12 @@ Dependencies: `pdfplumber>=0.11.10,<0.12`, `pdfminer.six>=20251107`, `pypdfium2`
 
     A cycle in inherited `/MediaBox` costs `page_timeout_s` on every page, up to the total timeout.
 11. **A short but well-formed page tree passes as complete.** If `/Kids` lists fewer pages than the document had, and every entry is a page, the run reports what it found with exit 0, so AC-1 rests on the tree. `/Count` would show the gap, but it is untrusted. It matched the pages found in 1,571 of 1,571 real PDFs that opened, but that sample is mostly Apple-produced. PDFium follows `/Count`, so it reported 9 pages for a 4-page file with `/Count 9`. Flagging a mismatch needs a new output signal. The user chose no flag at iteration 1's Integrate, so this is an accepted limit.
+12. **The PDFium worker has residuals.**
+    - A C-level hang in PDFium keeps the worker busy for the rest of the process. Each later repair waits, and each caller is stopped at its own deadline, so a library host loses repair until it restarts. The CLI's process ends anyway.
+    - An abandoned job still runs PDFium's load to its end, because only the write sink can be cut short. That costs CPU after the caller has moved on, up to one damaged file's load per abandoned job.
+    - At interpreter exit, a job still running after `PDFIUM_EXIT_WAIT_S` races pypdfium2's `destroy_lib`, which can crash the exiting process. Output is already written by then, and `document.xml` last, so the crash changes only the exit status of a process that was ending anyway.
+    - A host that calls pypdfium2 itself on another thread isn't serialised with the worker.
+13. **Encrypted input is never repaired.** A damaged file with only an owner password opens without one in most readers, but here it exits 2 with `input is not a valid PDF`, or gets a page-1 error page and exit 3, where PDFium might have repaired it. The one such probe case, with no `/Root`, failed PDFium's repair anyway. A damaged file whose `/Encrypt` sits in a trailer pdfminer can't find isn't recognised and is repaired.
 
 ## Patterns
 
@@ -334,7 +372,7 @@ Dependencies: `pdfplumber>=0.11.10,<0.12`, `pdfminer.six>=20251107`, `pypdfium2`
 | C9 | PAT-1, PAT-2, PAT-4 | `xmlwriter.py` for PAT-4 |
 | C10, C11 | PAT-2, PAT-4 | none |
 
-Exception to note, within the rules: the watchdog and the shim sit outside the stages, so PAT-3 holds. `Document` is mutable and holds a parser object, but it never reaches a stage. Only `RawPage` does. `convert` writes only through `OutputDir` in the writer.
+Exception to note, within the rules: the watchdog, the shim, the `_initialize_password` wrapper and the PDFium worker sit outside the stages, so PAT-3 holds. The wrapper and the worker are in `adapter.py`, so PAT-2 holds. `Document` is mutable and holds a parser object, but it never reaches a stage. Only `RawPage` does. `convert` writes only through `OutputDir` in the writer.
 
 ## Threat model
 
@@ -352,7 +390,7 @@ Exception to note, within the rules: the watchdog and the shim sit outside the s
 | 4 | Memory exhaustion by other routes | Peak RSS poll, fatal | SEC-4 |
 | 5 | Huge file, or a page count that is huge or lies | Refuse on size and `/Count`, and enforce during iteration | SEC-5 |
 | 6 | Character flood on one page | `max_chars_per_page` | SEC-6 |
-| 7 | Very deep table nesting, to overflow recursion | `max_table_depth` | SEC-7 |
+| 7 | Very deep table nesting, to overflow recursion: floating, edge-to-edge (inferred), or with aligned text in the deepest cell | `max_table_depth` counts every level, inferred and text-detected ones too. `collapse` gets only the levels left, so its own recursion is bounded too | SEC-7 |
 | 8 | Markup or forbidden characters in text | Sanitizer, ElementTree escaping (AC-24) | AC-24 |
 | 9 | Injection through error text or parser log output into XML, terminals or logs | Closed message vocabulary, control chars stripped. `NullHandler` and `propagate=False` on the `pdfminer` and `pdfplumber` loggers | SEC-8 |
 | 10 | Planted symlink redirects a write | `O_EXCL` temp plus `os.replace`, unlink doesn't follow | SEC-9 |
@@ -361,10 +399,12 @@ Exception to note, within the rules: the watchdog and the shim sit outside the s
 | 13 | Parser spawns a process or uses the network | Never `repair=True`, no such code path | SEC-12 |
 | 14 | Crafted `/Encoding` name reads a file or loads a pickle | `pdfminer.six>=20251107`: JSON CMaps with path containment | SEC-13 |
 | 15 | Non-finite coordinates, from transforms or the MediaBox, break the schema | Checked in the adapter, page error. A non-finite page box leaves `page_bbox` at `BBox(0, 0, 0, 0)` | SEC-14 |
-| 16 | PDFium exploit | Fallback only, never for encrypted or over-limit input, size-bounded, audited | SEC-15 |
+| 16 | PDFium exploit, including through an encrypted file whose `/Encrypt` is malformed so that pdfminer fails with something other than `PDFEncryptionError` | Fallback only, never for encrypted or over-limit input, size-bounded, audited. Encrypted means a non-null `/Encrypt` in a trailer pdfminer reads, recorded by the `_initialize_password` wrapper whatever the dictionary holds. A crafted file can omit `/Encrypt`, so this keeps honest encrypted files away from PDFium, and the exploit risk stays (Risk 8) | SEC-15 |
 | 17 | Disk filling from repeated pages | Bounded by the char cap and total timeout together, a few GB at most. Accepted | none |
-| 18 | Reference cycle spins forever in pdfminer's `resolve1`: `/Root`, `/Info`, `/Encrypt`, `/Pages`, `/Count`, `/Kids`, or a page's `/Contents`, `/Resources`, `/MediaBox`, `/Rotate`, or a stream's `/Length` | Watchdog over `open_document` and each `advance` at `page_timeout_s`. A cycle met while building one page's entry, such as its `/Contents`, `/Resources`, `/MediaBox` or `/Rotate`, or a `/Kids` entry below the root, is that page's error, and later pages are read. So is one reached only in `read`, such as in a font resource, as in row 2. A cycle in `/Root`, `/Info`, `/Encrypt`, `/Count`, the root `/Pages` or its `/Kids` ends the run (Risk 10) | SEC-16 |
+| 18 | Reference cycle spins forever in pdfminer's `resolve1`: `/Root`, `/Info`, `/Encrypt`, `/Pages`, `/Count`, `/Kids`, or a page's `/Contents`, `/Resources`, `/MediaBox`, `/Rotate`, or a stream's `/Length` | Watchdog over `open_document` and each `advance` at `page_timeout_s`. A cycle met while building one page's entry, such as its `/Contents`, `/Resources`, `/MediaBox` or `/Rotate`, or a `/Kids` entry below the root, is that page's error, and later pages are read. So is one reached only in `read`, such as in a font resource, as in row 2. A cycle in `/Root`, `/Info`, `/Encrypt`, `/Count`, the root `/Pages` or its `/Kids` ends the run (Risk 10). An `/Encrypt` cycle spins before the encryption record is written, and the stop ends the run before any repair | SEC-16 |
 | 19 | A damaged or crafted page tree passes a short document off as complete: a `/Kids` entry that is dangling, not a dict, not a `/Page`, or repeated, which pdfminer skips silently | Own page-tree walker: one entry per `/Kids` leaf, and an entry that isn't a page gives an error page at its own number. A short but well-formed tree isn't detected (Risk 11) | SEC-17 |
+| 20 | PDFium driven unsafely from the library: two host threads repairing damaged PDFs at once, though PDFium isn't thread-safe, or a watchdog stop landing inside PDFium, where pypdfium2's write callback swallows it, prints a traceback and leaves a truncated repaired copy, or a stopped thread stuck waiting on a lock past its deadline | Every PDFium call on one adapter-owned worker thread. Callers wait by polling an `Event`, so a stop lands in the caller. An abandoned job is skipped or its writes dropped, and its result discarded. Residuals in Risk 12 | SEC-18 |
+| 21 | Concurrent runs with different stream limits loosen each other's bound, so a flate bomb gets past the stricter one | The shim reads a per-thread limit, set and restored by each adapter entry point | SEC-19 |
 
 ## Criteria coverage
 
@@ -381,21 +421,25 @@ Exception to note, within the rules: the watchdog and the shim sit outside the s
 | AC-9 | `unicode_norm=None`, `group_lines` with no reordering |
 | AC-10 | `build_forest`, `compose_page` |
 | AC-11 | `make_grid` spans, `collapse` returning `None` |
-| AC-12, AC-13 | `build_forest` parenting, `populate` |
-| AC-14 | `collapse` |
-| AC-15, AC-16 | `detect_text_table`, leaf ruled cells only |
+| AC-12, AC-13 | `build_forest` parenting, at every inferred level, `populate` |
+| AC-14 | `collapse` with `max_levels`, kept flat when the collapse won't fit |
+| AC-15, AC-16 | `detect_text_table`, leaf ruled cells only, inferred ones included, below `max_table_depth` |
 | AC-17 | `compose_page` status, `images` to `figure` |
 | AC-18 | Page boundary in `api.py`, which also gets page-tree entry faults through `read`, exit 3. Not for the faults in Risk 10 |
-| AC-19, AC-20 | `open_document` classification, C11 exit 2, `OutputDir.prepare` |
-| AC-21 | PDFium repair path, also tried for a failed first page-tree entry |
+| AC-19, AC-20 | `open_document` classification, with the encryption record for AC-20, C11 exit 2, `OutputDir.prepare` |
+| AC-21 | PDFium repair path on the worker, also tried for a failed first page-tree entry of input that isn't encrypted |
 | AC-22 | PAT-4, total sort keys, fixed precision; `PYTHONHASHSEED` test |
 | AC-23 | Lazy pages with caching off: 9 to 20 s for J200 across noisy runs; subprocess peak RSS test J50 vs J200 |
 | AC-24 | `sanitize_chars`, ElementTree, `replaced-chars` |
 | AC-25 | C2, including the watchdog over `open_document` and each `advance`, the bounded zlib shim, `max_pages`, `max_file_bytes` |
-| SEC-8 | Closed `message` vocabulary, `_report`, parser logger setup in the adapter |
+| SEC-7 | `build_forest` depth rule over every level, `collapse` bounded by `max_levels`, text-table detection only below `max_table_depth` |
+| SEC-8 | Closed `message` vocabulary, `_report`, parser logger setup in the adapter. A stop during repair lands in the caller's wait, not in pypdfium2's callback |
 | SEC-14 | Finite checks in `read`, `page_bbox` rule, `error_page` |
+| SEC-15 | The encryption record and classifier, the page-1 rule skipping repair for encrypted input, the size check before repair (#7) |
 | SEC-16 | `StructureTimeout` arms over `open_document` and `Document.advance`, caught per entry by the walker and raised by `read` as `PageTimeout`, the run-ending rule in `convert` for the root and the walker's own code |
 | SEC-17 | Own page-tree walker, `PageEntryError`, `page_number` counting failed entries |
+| SEC-18 (proposed) | PDFium worker, polled wait, abandoned jobs |
+| SEC-19 (proposed) | Per-thread limit in the zlib shim, set and restored by `open_document`, `advance` and `read` |
 | INV-1 | All chars pass through `populate` to `group_lines`. Whitespace aside, none is dropped. Compared modulo the sanitizer's replacements |
 | INV-2 | Union bboxes, row rule, `overflow` set on `page` and `cell` |
 | INV-3 | `OutputDir`, no subprocess or socket use; `sys.addaudithook` test, with `PYTHONDONTWRITEBYTECODE` |
