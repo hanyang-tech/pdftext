@@ -40,8 +40,11 @@ scripts/convert.sh pdfs/                # writes out/<name>/ for each PDF in pdf
 scripts/convert.sh pdfs/ results/ --page-timeout 10
 ```
 
-Options after the output folder go to `pdftext` unchanged. The script exits with the worst exit
-code it saw.
+Options after the output folder go to `pdftext` unchanged, except `-o` and `--output`, which the
+script rejects because it sets the output folder itself. In a folder, a PDF whose name differs
+from an earlier one's only in case (`x.pdf` and `x.PDF`) is skipped and counted as refused, so two
+PDFs never share an output folder. The script exits with the most severe exit code it saw, ranked
+1, then 2, then 3, then 0 (the table below), not the highest number.
 
 ### Exit codes
 
@@ -62,8 +65,8 @@ Untrusted PDFs can't hang the parser or exhaust memory. Each limit has a default
 | `--max-pages` | 10,000 | refused, exit 2 |
 | `--total-timeout` | 1800 s | run stops, exit 2 |
 | `--max-memory-bytes` | 2 GiB | run stops, exit 2 |
-| `--page-timeout` | 30 s | that page is an error page, exit 3 |
-| `--max-stream-bytes` | 256 MiB | that page is an error page, exit 3 |
+| `--page-timeout` | 30 s | usually that page is an error page (exit 3); if hit while opening the file or reading the document structure, the run stops (exit 2) |
+| `--max-stream-bytes` | 256 MiB | usually that page is an error page (exit 3); if hit while opening the file or reading the document structure, the run stops (exit 2) |
 | `--max-chars-per-page` | 200,000 | that page is an error page, exit 3 |
 | `--max-table-depth` | 16 | a deeper table is dropped and its text kept in the enclosing cell |
 
