@@ -3,8 +3,8 @@
 - **Branch:** `sdlc/pdf-layout-xml` (base: `main`; both unborn until the first commit)
 - **Iteration:** 5 of max 5
 - **Lanes:** iteration 2: lanes a, b, c merged (`3903359`, `2709725`, `7dd2585`); worktrees removed. Iteration 3: design delta `372a95f`; lanes c, b, a merged as `5349f46`, `f4d8d18`, `3881fe6`; worktrees removed at Integrate. Iteration 4: lanes a and b merged (`c04dbf3`, `5ff6a0f`). Iteration 5: lane a merged as `95f89f6`; worktree removed.
-- **Phase:** Release (re-run from 2026-11-06 18:58Z). Iteration 5 done: lane a merged (`95f89f6`), full suite 1304 passed, 1 skipped, all 48 rows ✅, DECISION RELEASE. Final review and security pass on the whole branch next, then PAT-5 and the push to the user
-- **Gates:** requirements ✅ approved 2026-11-05 · design ✅ approved 2026-11-05 · release ⏳
+- **Phase:** Release gate (from 2026-11-06 19:15Z). Both release reviews APPROVED on the whole branch, `release.md` written. Waiting on the user to confirm PAT-5 and approve the push and PR
+- **Gates:** requirements ✅ approved 2026-11-05 · design ✅ approved 2026-11-05 · release ⏳ asked 2026-11-06 19:15Z
 - **Mode:** interactive · verify: auto
 
 ## Checks
@@ -143,3 +143,5 @@ Verified by the full-suite run on `3881fe6` (iteration 3 merged), 981 tests. Row
 - 2026-11-06 Iteration 5 Design: architect delta `iterations/05/architect-delta.md` (17:12Z–17:43Z, contract check passed). The user approved all three recommended answers: alarm only for `hard_stop=True` on the main thread; residual GIL gap accepted and named (Risk 14, threat row 3); SEC-3 split into (a) and (b), SEC-20 added. Applied to `design.md` and `requirements.md`.
 - 2026-11-06 Lane 5a: engineer 18:13Z–18:21Z. Round 1: reviewer CHANGES_REQUESTED (MAJOR #1, `setitimer` refused timeouts over 1e8 s, so the CLI exited 1), tester PASS (11 new alarm tests, `c6462fa`). Driver clarified SEC-3 (a)'s workload to `start_re` and noted the cap and the cancelled host timer in `design.md`. Round 2 (`037f7dd`, `ALARM_MAX_S`): reviewer APPROVED, tester PASS. #65 and #66 added.
 - 2026-11-06 Iteration 5 integrated: lane a squashed as `95f89f6`, worktree removed; README Threads line for `hard_stop=True`. Full suite 1304 passed, 1 skipped in 103 s, coverage 99%, scanners clean. 48 of 48 rows ✅; #63 and #64 done. Retro DECISION: RELEASE (1 h 48 min). Release re-run starts.
+- 2026-11-06 Release re-run from 18:56Z on `51a3f21`: final reviewer (code-reviewer, opus) and security reviewer (general-purpose, opus) launched on `git diff 8e6166f...HEAD -- . ':!docs/sdlc'`, reports `release/final-review-2.md` and `release/security-2.md`. Full suite reused from Integrate (code unchanged since `95f89f6`).
+- 2026-11-06 Release re-run results: final reviewer APPROVED (2 MINORs: README overclaim → #67, `nan` with `setitimer` → #38's row; PAT-5 followed with the `_open_pdf` reset noted), security reviewer APPROVED with no findings (20 of 22 threat rows tested, 17 and 22 accepted; U1 to U3 → #68). No BLOCKER, so no skeptics. Completeness: 45 + 3 criteria, 20 + 2 abuse cases, 10 of 10 lanes, 66 reports, 0 send-backs. `release.md` written. Gate asked at 19:15Z: PAT-5 and the push.
