@@ -3,7 +3,7 @@
 - **Branch:** `sdlc/pdf-layout-xml` (base: `main`; both unborn until the first commit)
 - **Iteration:** 3 of max 5
 - **Lanes:** iteration 2: lanes a, b, c merged (`3903359`, `2709725`, `7dd2585`); worktrees removed. Iteration 3: design delta `372a95f`; lanes c, b, a merged as `5349f46`, `f4d8d18`, `3881fe6`; worktrees removed at Integrate.
-- **Phase:** Iteration 4 (from 2026-11-06, Release findings): Design, architect delta for backlog #44 and #45; lane b (#46, #22) runs during the gate
+- **Phase:** Iteration 4 (from 2026-11-06, Release findings): lane a (#44, #45) 3 Plan after the design gate; lane b (#46, #22) in 5 Verify, fix round 2 (memory test flaky, 29 of 30; reviewer APPROVED)
 - **Gates:** requirements ✅ approved 2026-11-05 · design ✅ approved 2026-11-05 · release ⏳
 - **Mode:** interactive · verify: auto
 
@@ -99,7 +99,7 @@ Verified by the full-suite run on `3881fe6` (iteration 3 merged), 981 tests. Row
 | AC-16 | ✅ | `tests/test_text_table.py::TestWhenThereIsNoTable`, `tests/test_nesting_edges.py` prose page of `nested.pdf` (it. 3b) |
 | AC-23 | ✅ | `tests/test_performance.py::test_converts_200_dense_pages_in_under_a_minute` (about 8 s), `test_peak_memory_does_not_grow_with_the_page_count`, `test_the_timed_conversion_wrote_every_page_with_all_of_its_text` (it. 3c) |
 | AC-25 | ✅ | `tests/test_limits_run.py::TestDefaults` and every limit class there; `tests/test_cli.py` limit options, `inf` and `nan` refused (it. 3a) |
-| SEC-1 | 🟡 | Flate only: `tests/test_limits_run.py::TestStreamThatInflatesPastTheLimit` (it. 3a). RunLength and LZW streams bypass `max_stream_bytes` (`release/security.md` #1, reproduced by the driver: a 2 MiB RunLength stream converts with exit 0 under a 1 MiB limit). Backlog #44, iteration 4 |
+| SEC-1 | 🟡 | reworded at the iteration 4 gate to name every route; Flate only: `tests/test_limits_run.py::TestStreamThatInflatesPastTheLimit` (it. 3a). RunLength and LZW streams bypass `max_stream_bytes` (`release/security.md` #1, reproduced by the driver: a 2 MiB RunLength stream converts with exit 0 under a 1 MiB limit). Backlog #44, iteration 4 |
 | SEC-2 | ✅ | `tests/test_limits_run.py::TestPageTimeout::test_gives_an_error_page_within_three_seconds_for_a_billion_draws` (it. 3a) |
 | SEC-3 | ✅ | `tests/test_limits_run.py::TestPageTimeout::test_exits_two_with_one_line_when_the_main_thread_is_stuck_in_a_c_call` (it. 3a) |
 | SEC-4 | ✅ | `tests/test_limits_run.py::TestMemoryLimit`, `tests/test_watchdog.py` memory tests (it. 3a) |
@@ -135,3 +135,5 @@ Verified by the full-suite run on `3881fe6` (iteration 3 merged), 981 tests. Row
 - 2026-11-06 Iteration 3 closed in 4 h 16 min (2 h 9 min of it lane a waiting on the user's design answers). All 47 rows verified, 981 tests, no `must` left. DECISION: RELEASE. Pattern candidate PAT-5 (import-time seams reading a `threading.local`) to confirm at Release.
 - 2026-11-06 Release started at 06:20Z. The user asked mid-step for a README or a script to run the parser: README rewritten (install, run, exit codes, limits, output with bbox convention) and `scripts/convert.sh` added (one PDF or a folder), committed as `4514824` before the reviews so they cover it. Final reviewer (code-reviewer, opus) and security reviewer (general-purpose, opus) launched on `git diff 8e6166f...HEAD`.
 - 2026-11-06 Release reviews back. Final reviewer APPROVED with 8 MINORs (`release/final-review.md`). Security reviewer CHANGES_REQUESTED: MAJOR #1, `max_stream_bytes` bounds only FlateDecode, so RunLength and LZW streams decode unbounded; 4 MINORs and 2 design issues (`release/security.md`). Driver reproduced #1 (2 MiB RunLength stream, exit 0 under a 1 MiB limit). No BLOCKER, so no skeptics. SEC-1 back to 🟡. Backlog #44 to #53 added, #22 raised. Routing: #1 needs a mitigation the design doesn't have (threat row 1 names zlib only), so it goes to Design as an architect delta with the user's gate, in iteration 4.
+- 2026-11-06 Iteration 4 started at 06:53Z (`iterations/04.md`): architect delta for #44 and #45 launched (report `iterations/04/architect-delta.md`); lane b (#46, #22) planned from `785e888` and its engineer started in worktree `pdf-layout-xml-04b`, since it touches nothing in the delta.
+- 2026-11-06 Iteration 4 design gate: the user accepted all four recommended answers. `max_stream_bytes` default 32 MiB; CCITTFax refused under a limit; content-parser amplification accepted under threat row 4, backlog #60; SEC-1 and SEC-19 reworded in `requirements.md`. Driver changed `design.md` C3 to "bounded decode filters". Lane b fix round 2 (`e21cb06`, memory test on the traced heap) in delta review and test.
