@@ -66,7 +66,7 @@ Untrusted PDFs can't hang the parser or exhaust memory. Each limit has a default
 | `--total-timeout` | 1800 s | run stops, exit 2 |
 | `--max-memory-bytes` | 2 GiB | run stops, exit 2 |
 | `--page-timeout` | 30 s | usually that page is an error page (exit 3); if hit while opening the file or reading the document structure, the run stops (exit 2) |
-| `--max-stream-bytes` | 256 MiB | usually that page is an error page (exit 3); if hit while opening the file or reading the document structure, the run stops (exit 2) |
+| `--max-stream-bytes` | 32 MiB | usually that page is an error page (exit 3); if hit while opening the file or reading the document structure, the run stops (exit 2) |
 | `--max-chars-per-page` | 200,000 | that page is an error page, exit 3 |
 | `--max-table-depth` | 16 | a deeper table is dropped and its text kept in the enclosing cell |
 
