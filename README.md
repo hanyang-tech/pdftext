@@ -146,6 +146,13 @@ Each call has its own watchdog, which raises a stop in the converting thread whe
 memory limit passes. The memory limit counts the growth of the process's peak memory since the
 call began, so conversions running at the same time count each other's growth.
 
+`convert(..., hard_stop=True)` is what the CLI uses: if a stop isn't taken within a grace period,
+it prints one line and exits the process with code 2. Called on the main thread, it also installs
+a SIGALRM handler and interval timer for the run, so a long regex or other C call that checks
+signals is stopped at its deadline. The previous SIGALRM handler is restored afterwards, but a
+timer your program had running is cancelled. Leave `hard_stop` off in a program that uses
+SIGALRM or must not exit.
+
 ## Development
 
 ```
