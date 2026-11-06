@@ -8,6 +8,8 @@ Coordinates are PDF user space: points, origin at the bottom left.
 
 import hashlib
 import struct
+import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import count
 
@@ -196,13 +198,120 @@ def build_image_pdf(
     return serialise(objects)
 
 
+_ADLER_MODULUS = 65521
+_BLOCK = 1 << 20
+
+
+def inflating_content(prefix: bytes, padding: int) -> bytes:
+    """A zlib stream that inflates to `prefix` followed by `padding` spaces.
+
+    The padding is written as one block repeated, so a multi-gigabyte bomb is made instantly and
+    stays a few megabytes. Spaces are ignored by a content-stream parser, so `prefix` keeps its
+    meaning.
+    """
+    compressor = zlib.compressobj(level=9, wbits=-15)  # raw deflate, wrapped below
+    head = compressor.compress(prefix) + compressor.flush(zlib.Z_FULL_FLUSH)
+    # A full flush resets the dictionary, so every block of spaces compresses to the same bytes.
+    block = compressor.compress(b" " * _BLOCK) + compressor.flush(zlib.Z_FULL_FLUSH)
+    blocks, rest = divmod(padding, _BLOCK)
+    tail = compressor.compress(b" " * rest) + compressor.flush(zlib.Z_FINISH)
+    body = head + block * blocks + tail
+    return b"\x78\xda" + body + struct.pack(">I", _adler32_with_spaces(prefix, padding))
+
+
+def _adler32_with_spaces(prefix: bytes, padding: int) -> int:
+    """The Adler-32 of `prefix` followed by `padding` spaces, without building them."""
+    checksum = zlib.adler32(prefix)
+    low, high = checksum & 0xFFFF, checksum >> 16
+    space = 32
+    high = (high + padding * low + space * padding * (padding + 1) // 2) % _ADLER_MODULUS
+    low = (low + padding * space) % _ADLER_MODULUS
+    return (high << 16) | low
+
+
+def content_object_id(page_index: int) -> int:
+    """The object number of the content stream of page `page_index` in `build_objects`."""
+    return page_object_id(page_index) + 1
+
+
+def with_inflating_content(objects: dict[int, bytes], page_index: int, inflated: int) -> None:
+    """Make page `page_index`'s content stream inflate to `inflated` bytes, with its text kept."""
+    number = content_object_id(page_index)
+    _, _, rest = objects[number].partition(b"stream\n")
+    content = rest.rpartition(b"\nendstream")[0]
+    compressed = inflating_content(content, inflated - len(content))
+    objects[number] = (
+        b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(compressed)
+        + compressed
+        + b"\nendstream"
+    )
+
+
+def with_char_flood(objects: dict[int, bytes], page_index: int, chars: int) -> None:
+    """Make page `page_index` show `chars` characters, from a content stream of a few kilobytes.
+
+    The characters are one repeated byte in a single string, so the stream compresses to almost
+    nothing, and the page's own text is replaced.
+    """
+    number = content_object_id(page_index)
+    compressed = zlib.compress(b"BT /F1 1 Tf 0 700 Td (" + b"A" * chars + b") Tj ET", 9)
+    objects[number] = (
+        b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(compressed)
+        + compressed
+        + b"\nendstream"
+    )
+
+
+def with_draw_fan_out(
+    objects: dict[int, bytes], page_index: int, levels: int = 3, fan_out: int = 1000
+) -> None:
+    """Make page `page_index` draw `fan_out ** levels` empty forms, nested `levels` deep.
+
+    Each form draws the next one `fan_out` times, so the page is a CPU bomb that is a few
+    kilobytes in the file. The page's own text is replaced.
+    """
+    first = max(objects) + 1
+    forms = range(first, first + levels + 1)  # the last one is empty
+    for number in forms:
+        is_leaf = number == forms[-1]
+        draws = b"" if is_leaf else b"/Fm Do\n" * fan_out
+        resources = (
+            b"" if is_leaf else f"/Resources << /XObject << /Fm {number + 1} 0 R >> >>".encode()
+        )
+        objects[number] = (
+            b"<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] %s /Length %d >>\nstream\n"
+            % (resources, len(draws))
+            + draws
+            + b"\nendstream"
+        )
+    page = objects[page_object_id(page_index)]
+    objects[page_object_id(page_index)] = page.replace(
+        b"/Resources << ", f"/Resources << /XObject << /Fm {first} 0 R >> ".encode()
+    )
+    objects[content_object_id(page_index)] = _stream(b"/Fm Do")
+
+
+def with_reference_cycle(objects: dict[int, bytes]) -> str:
+    """Add two objects that refer to each other, and return a reference into the cycle."""
+    first = max(objects) + 1
+    objects[first] = b"%d 0 R" % (first + 1)
+    objects[first + 1] = b"%d 0 R" % first
+    return f"{first} 0 R"
+
+
 _PAD = bytes.fromhex("28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A")
 _FILE_ID = bytes(range(16))
 _PERMISSIONS = -4
 
 
-def build_encrypted_pdf(user_password: str, pages: list[PageSpec] | None = None) -> bytes:
+def build_encrypted_pdf(
+    user_password: str,
+    pages: list[PageSpec] | None = None,
+    damage: Callable[[dict[int, bytes]], None] | None = None,
+) -> bytes:
     """A PDF protected with a user password, by the standard handler (RC4, 40 bit).
+
+    `damage` changes the numbered objects (as `build_objects` makes them) before they are encrypted.
 
     Every stream is encrypted with its own object key, as a real file is, so with the right
     password (the empty one included) a reader gets the pages back as `build_pdf` writes them.
@@ -219,10 +328,10 @@ def build_encrypted_pdf(user_password: str, pages: list[PageSpec] | None = None)
         f"<< /Filter /Standard /V 1 /R 2 /P {_PERMISSIONS} "
         f"/O <{owner_entry.hex()}> /U <{user_entry.hex()}> >>"
     )
-    objects = {
-        number: _encrypt_stream(body, number, key)
-        for number, body in build_objects(pages if pages is not None else [PageSpec()]).items()
-    }
+    plain = build_objects(pages if pages is not None else [PageSpec()])
+    if damage is not None:
+        damage(plain)
+    objects = {number: _encrypt_stream(body, number, key) for number, body in plain.items()}
     return serialise(
         objects,
         trailer_extra=f"/Encrypt {encrypt} /ID [<{_FILE_ID.hex()}> <{_FILE_ID.hex()}>]",
@@ -257,4 +366,56 @@ def _rc4(key: bytes, data: bytes) -> bytes:
         j = (j + state[i]) % 256
         state[i], state[j] = state[j], state[i]
         out.append(byte ^ state[(state[i] + state[j]) % 256])
+    return bytes(out)
+
+
+def build_pdf_with_catalog_in_object_stream(inflated: int) -> bytes:
+    """A one-page PDF whose catalog is in a compressed object stream that inflates to `inflated`.
+
+    The reader meets the stream while it opens the file, before any page is read, so a limit on
+    stream size has to hold there too.
+    """
+    return build_pdf_with_object_in_object_stream(1, inflated, [PageSpec()])
+
+
+def build_pdf_with_object_in_object_stream(
+    number: int, inflated: int, pages: list[PageSpec]
+) -> bytes:
+    """A PDF made by `build_objects` whose object `number` is in an object stream.
+
+    The stream inflates to `inflated` bytes, so it is a bomb when `inflated` is large. The file
+    ends with a cross-reference stream, as a file with object streams does.
+    """
+    objects = build_objects(pages)
+    body = objects.pop(number)
+    header = b"%d 0 " % number
+    packed = inflating_content(header + body, inflated - len(header + body))
+    stream_id = max(objects, default=0) + 1
+    xref_id = stream_id + 1
+    out = bytearray(b"%PDF-1.7\n")
+    offsets = {}
+    for object_number, object_body in objects.items():
+        offsets[object_number] = len(out)
+        out += b"%d 0 obj\n" % object_number + object_body + b"\nendobj\n"
+    offsets[stream_id] = len(out)
+    out += (
+        b"%d 0 obj\n<< /Type /ObjStm /N 1 /First %d /Filter /FlateDecode /Length %d >>\nstream\n"
+        % (stream_id, len(header), len(packed))
+        + packed
+        + b"\nendstream\nendobj\n"
+    )
+    offsets[xref_id] = len(out)
+    entries = bytearray(b"\x00\x00\x00\x00\x00\x00\xff")  # object 0, free
+    for object_number in range(1, xref_id + 1):
+        if object_number == number:  # in the object stream, at index 0
+            entries += b"\x02" + stream_id.to_bytes(4, "big") + (0).to_bytes(2, "big")
+        else:
+            entries += b"\x01" + offsets[object_number].to_bytes(4, "big") + (0).to_bytes(2, "big")
+    out += (
+        b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root 1 0 R /Length %d >>\nstream\n"
+        % (xref_id, xref_id + 1, len(entries))
+        + bytes(entries)
+        + b"\nendstream\nendobj\n"
+    )
+    out += b"startxref\n%d\n%%%%EOF\n" % offsets[xref_id]
     return bytes(out)

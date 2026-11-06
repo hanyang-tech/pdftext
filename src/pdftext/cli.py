@@ -1,6 +1,7 @@
 """The `pdftext` command: arguments, exit codes and one-line errors."""
 
 import argparse
+import math
 import sys
 from collections.abc import Sequence
 from importlib.metadata import version
@@ -25,8 +26,9 @@ def _positive_int(text: str) -> int:
 
 def _positive_float(text: str) -> float:
     number = float(text)
-    if not number > 0:  # also rejects NaN
-        raise argparse.ArgumentTypeError("must be positive")
+    # Rejects NaN too. An infinite timeout would switch the limit off, which AC-25 forbids.
+    if not 0 < number < math.inf:
+        raise argparse.ArgumentTypeError("must be positive and finite")
     return number
 
 

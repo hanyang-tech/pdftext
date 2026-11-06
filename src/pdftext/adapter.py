@@ -4,31 +4,40 @@ It opens a file, walks the page tree one entry at a time, reads each page into p
 and closes the page. Nothing it returns refers back to pdfminer, pdfplumber or pypdfium2.
 """
 
+import atexit
 import logging
 import math
+import queue
+import threading
+import zlib
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BufferedReader, BytesIO
 from itertools import chain
 from pathlib import Path
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Any, NamedTuple, Self
 
 import pdfplumber
 import pypdfium2  # type: ignore[import-untyped]  # ships no type information
+from pdfminer import pdftypes
 from pdfminer.pdfdocument import PDFDocument, PDFEncryptionError
 from pdfminer.pdfexceptions import PDFException, PDFObjectNotFound
 from pdfminer.pdfpage import LITERAL_PAGE, LITERAL_PAGES, PDFPage
 from pdfminer.pdftypes import PDFObjRef, resolve1
 from pdfplumber.page import Page as PlumberPage
+from pdfplumber.page import PDFPageAggregatorWithMarkedContent
 from pdfplumber.pdf import PDF
 from pdfplumber.utils.exceptions import PdfminerException
 
-from pdftext.errors import EncryptedPdfError, InvalidPdfError
-from pdftext.limits import Limits
+from pdftext.errors import EncryptedPdfError, InvalidPdfError, LimitExceededError, PdftextError
+from pdftext.limits import Limits, PageTimeout, StructureTimeout
 from pdftext.model import BBox, RawChar, RawPage
 
 _QUARTER_TURNS = (90, 270)
+PDFIUM_EXIT_WAIT_S = 2.0  # how long interpreter exit waits for a repair that is still running
+_PDFIUM_POLL_S = 0.05  # how often a caller waiting for the worker can be stopped
 _Stream = BufferedReader | BytesIO  # the file, or a repaired copy of it
 _INHERITABLE = PDFPage.INHERITABLE_ATTRS
 
@@ -44,6 +53,112 @@ for _parser_logger_name in ("pdfminer", "pdfplumber"):
 _UNKNOWN_BBOX = BBox(0, 0, 0, 0)
 
 
+class _StreamLimit(threading.local):
+    """The decompressed-stream limit of the run on this thread. None means no limit."""
+
+    max_bytes: int | None = None
+
+
+_stream_limit = _StreamLimit()
+
+
+def _bounded_decompress(data: bytes) -> bytes:
+    """`zlib.decompress`, refusing to produce more than this thread's limit."""
+    max_bytes = _stream_limit.max_bytes
+    if max_bytes is None:
+        return zlib.decompress(data)
+    decompressor = zlib.decompressobj()
+    inflated = decompressor.decompress(data, max_bytes + 1)
+    if len(inflated) > max_bytes:
+        raise LimitExceededError("a stream is too large")
+    if not decompressor.eof:
+        raise zlib.error("incomplete or truncated stream")  # as `zlib.decompress` does
+    return inflated
+
+
+# The zlib C call can't be interrupted, so pdfminer's use of it is bounded from the inside
+# (Risk 6). The limit is per thread, so a host's own pdfminer use stays unbounded.
+pdftypes.zlib = SimpleNamespace(  # type: ignore[attr-defined,assignment]
+    decompress=_bounded_decompress, decompressobj=zlib.decompressobj, error=zlib.error
+)
+
+
+@contextmanager
+def _bounded_streams(max_bytes: int) -> Iterator[None]:
+    """Limit streams decompressed on this thread, then restore the limit it had."""
+    previous = _stream_limit.max_bytes
+    try:
+        _stream_limit.max_bytes = max_bytes
+        yield
+    finally:
+        _stream_limit.max_bytes = previous
+
+
+class _CharBudget(threading.local):
+    """How many more characters the page being read on this thread may have. None means no limit."""
+
+    remaining: int | None = None
+
+
+_char_budget = _CharBudget()
+_plumber_render_char = PDFPageAggregatorWithMarkedContent.render_char
+
+
+def _counting_render_char(
+    self: PDFPageAggregatorWithMarkedContent, *args: Any, **kwargs: Any
+) -> float:
+    """Refuse the character after the last one this thread's page may have, before it is built.
+
+    A page is built whole before it can be counted, and each character costs about 2 KB, so a
+    count afterwards would let a flood reach the memory limit first.
+    """
+    remaining = _char_budget.remaining
+    if remaining is not None:
+        if remaining == 0:
+            raise LimitExceededError("page has too many characters")
+        _char_budget.remaining = remaining - 1
+    return _plumber_render_char(self, *args, **kwargs)
+
+
+PDFPageAggregatorWithMarkedContent.render_char = _counting_render_char  # type: ignore[method-assign]
+
+
+@contextmanager
+def _bounded_chars(max_chars: int) -> Iterator[None]:
+    """Limit the characters built for a page on this thread, then restore the limit it had."""
+    previous = _char_budget.remaining
+    try:
+        _char_budget.remaining = max_chars
+        yield
+    finally:
+        _char_budget.remaining = previous
+
+
+class _EncryptionRecord(threading.local):
+    """What pdfminer did with `/Encrypt` in the open running on this thread."""
+
+    declared = False  # a trailer with a non-null /Encrypt was read
+    handler_ok = False  # and the security handler accepted it
+
+    def clear(self) -> None:
+        self.declared = False
+        self.handler_ok = False
+
+
+_encryption = _EncryptionRecord()
+_pdfminer_initialize_password = PDFDocument._initialize_password
+
+
+def _recording_initialize_password(self: PDFDocument, password: str = "") -> None:
+    """pdfminer calls this for each trailer with a non-null /Encrypt, before reading its keys."""
+    _encryption.declared = True
+    _pdfminer_initialize_password(self, password)
+    _encryption.handler_ok = True
+
+
+PDFDocument._initialize_password = _recording_initialize_password  # type: ignore[method-assign]
+
+
 class PageEntryError(Exception):
     """A page-tree entry that is not a page or a node of pages. Private to the walker."""
 
@@ -52,7 +167,7 @@ class PageEntryError(Exception):
 class _Entry:
     """One leaf of the page tree: its page object, or the fault met while building it."""
 
-    outcome: PDFPage | Exception
+    outcome: PDFPage | Exception | StructureTimeout
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,10 +188,12 @@ class Document:
         pdf: PDF,
         entries: Iterator[_Entry],
         declared_pages: int | None,
+        limits: Limits,
     ) -> None:
         self._stream = stream
         self._pdf = pdf
         self._entries = entries
+        self._limits = limits
         self._entry: _Entry | None = None
         self.declared_pages = declared_pages  # untrusted
         self.page_number = 0  # the entry advance last stepped to, good or failed
@@ -99,13 +216,18 @@ class Document:
 
         A fault in the entry itself is kept for `read`, so it is reported under the entry's number.
         """
-        try:
-            self._entry = next(self._entries, None)
-        except Exception as exc:
-            # The walk can't resume after a fault in the root of the tree, so the run ends.
-            raise InvalidPdfError("input is not a valid PDF") from exc
+        with _bounded_streams(self._limits.max_stream_bytes):
+            try:
+                self._entry = next(self._entries, None)
+            except PdftextError:
+                raise
+            except Exception as exc:
+                # The walk can't resume after a fault in the root of the tree, so the run ends.
+                raise InvalidPdfError("input is not a valid PDF") from exc
         if self._entry is None:
             return False
+        if self.page_number >= self._limits.max_pages:
+            raise LimitExceededError("input has too many pages")
         self.page_number += 1
         self.page_bbox = _UNKNOWN_BBOX
         return True
@@ -115,29 +237,41 @@ class Document:
         if self._entry is None:
             raise RuntimeError("read() needs a page from advance()")
         page_object = self._entry.outcome
+        if isinstance(page_object, StructureTimeout):
+            raise PageTimeout  # a stop caught while building the entry is a timeout on this page
         if isinstance(page_object, Exception):
             raise page_object
-        page = PlumberPage(self._pdf, page_object, page_number=self.page_number, initial_doctop=0)
-        try:
-            bbox = BBox(0, 0, page.width, page.height)
-            _require_finite(*bbox)
-            self.page_bbox = bbox
-            return _read_page(page, self.page_number, bbox)
-        finally:
-            page.close()
+        with (
+            _bounded_streams(self._limits.max_stream_bytes),
+            _bounded_chars(self._limits.max_chars_per_page),
+        ):
+            page = PlumberPage(
+                self._pdf, page_object, page_number=self.page_number, initial_doctop=0
+            )
+            try:
+                bbox = BBox(0, 0, page.width, page.height)
+                _require_finite(*bbox)
+                self.page_bbox = bbox
+                return _read_page(page, self.page_number, bbox)
+            finally:
+                page.close()
 
 
 def open_document(path: Path, limits: Limits) -> Document:
     """Open `path`.
 
-    Raises InvalidPdfError or EncryptedPdfError. `limits` is not enforced yet.
+    Raises InvalidPdfError, EncryptedPdfError or LimitExceededError.
     """
     try:
+        size = path.stat().st_size
         stream = path.open("rb")
     except (OSError, ValueError) as exc:  # ValueError: a NUL in the path
         raise InvalidPdfError("cannot read input file") from exc
     try:
-        return _open_stream(stream)
+        if size > limits.max_file_bytes:
+            raise LimitExceededError("input file is too large")
+        with _bounded_streams(limits.max_stream_bytes):
+            return _open_stream(stream, limits)
     except BaseException:
         stream.close()
         raise
@@ -145,84 +279,194 @@ def open_document(path: Path, limits: Limits) -> Document:
 
 class _Start(NamedTuple):
     document: Document
-    first_entry_failed: bool
+    first_fault: Exception | StructureTimeout | None  # why page 1's entry failed, if it did
+    encrypted: bool
 
 
-def _open_stream(stream: _Stream) -> Document:
+def _open_stream(stream: _Stream, limits: Limits) -> Document:
     """Open `stream`, through PDFium's repair when pdfminer can't, or can't read the first page.
 
     A repaired document takes over `stream`'s place, and `stream` is then closed here.
     """
     try:
-        start = _start(stream)
-    except (EncryptedPdfError, InvalidPdfError):
+        start = _start(stream, limits)
+    except PdftextError:
         raise
-    except Exception:
-        repaired = _repair_and_start(stream)
+    except Exception as exc:
+        if _encryption.declared:
+            # The security handler accepted it, so this is damage, and encrypted input never
+            # reaches PDFium (SEC-15).
+            raise InvalidPdfError("input is not a valid PDF") from exc
+        repaired = _repair_and_start(stream, limits)
         stream.close()
         return repaired.document
-    if not start.first_entry_failed:
+    fault = start.first_fault
+    if fault is None or start.encrypted or isinstance(fault, StructureTimeout | PdftextError):
+        # A limit met in page 1 stays page 1's error. PDFium would rewrite the stream past it.
         return start.document
     # PDFium keeps some page-tree faults, so the original stays the fallback with page 1 failed.
     try:
-        repaired = _repair_and_start(stream)
+        repaired = _repair_and_start(stream, limits)
     except InvalidPdfError:
         return start.document
-    if repaired.first_entry_failed:
+    if repaired.first_fault is not None:
         return start.document
     stream.close()
     return repaired.document
 
 
-def _start(stream: _Stream) -> _Start:
+def _start(stream: _Stream, limits: Limits) -> _Start:
     """Parse `stream`, read `/Count`, and take the first page-tree step, in that order.
 
     `/Count` comes first so that a fault caught inside page 1's entry can't leave it unread.
     """
     pdf = _open_pdf(stream)
+    encrypted = _encryption.declared
     pdf.doc.caching = False
     declared_pages = _declared_page_count(pdf.doc)
+    if declared_pages is not None and declared_pages > limits.max_pages:
+        raise LimitExceededError("input has too many pages")
     entries = _walk_pages(pdf.doc)
     first = next(entries, None)
     if first is None:
         raise InvalidPdfError("input has no pages")
-    document = Document(stream, pdf, chain((first,), entries), declared_pages)
-    return _Start(document, isinstance(first.outcome, Exception))
+    document = Document(stream, pdf, chain((first,), entries), declared_pages, limits)
+    fault = first.outcome if isinstance(first.outcome, Exception | StructureTimeout) else None
+    return _Start(document, fault, encrypted)
 
 
 def _open_pdf(stream: _Stream) -> PDF:
+    _encryption.clear()
     try:
         return pdfplumber.open(stream, unicode_norm=None, raise_unicode_errors=False)
     except PdfminerException as exc:
-        # The base class: a wrong password and a security handler pdfminer does not support
-        # both mean encrypted input, which must never reach PDFium (SEC-15).
-        if exc.args and isinstance(exc.args[0], PDFEncryptionError):
+        cause = exc.args[0] if exc.args else None
+        if isinstance(cause, LimitExceededError):
+            raise cause from None
+        # The security handler failed: a wrong password, a handler pdfminer doesn't support, or
+        # a malformed /Encrypt. All mean encrypted input, which must never reach PDFium (SEC-15).
+        if not _encryption.handler_ok and (
+            _encryption.declared or isinstance(cause, PDFEncryptionError)
+        ):
             raise EncryptedPdfError("input is password-protected") from exc
         raise
 
 
-def _repair_and_start(stream: _Stream) -> _Start:
+class _PdfiumJob:
+    """One repair: the damaged bytes in, PDFium's rewritten copy out."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.output = BytesIO()
+        self.error: Exception | None = None
+        self.abandoned = False  # the caller was stopped, so nobody wants the result
+        self.done = threading.Event()
+
+    def run(self) -> None:
+        document = pypdfium2.PdfDocument(self.data)  # looked up per job, so tests can spy on it
+        try:
+            document.save(self)
+        finally:
+            document.close()
+
+    def write(self, data: bytes) -> int:
+        """The sink PDFium saves into. An abandoned job drops its output, so `save` ends fast."""
+        if not self.abandoned:
+            self.output.write(data)
+        return len(data)
+
+
+class _PdfiumWorker:
+    """The one thread that runs every pypdfium2 call, because PDFium isn't thread-safe.
+
+    Callers wait for a job by polling an Event, so a watchdog stop lands in their wait. Delivered
+    inside PDFium's write callback instead, it would be swallowed, and leave a truncated copy.
+    """
+
+    def __init__(self) -> None:
+        self._jobs: queue.Queue[_PdfiumJob] = queue.Queue()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._running: _PdfiumJob | None = None
+        self._closed = False
+
+    def repair(self, data: bytes) -> BytesIO:
+        """Rewrite `data` on the worker. A caller that is stopped abandons its job."""
+        job = _PdfiumJob(data)
+        self._submit(job)
+        try:
+            while not job.done.wait(_PDFIUM_POLL_S):
+                pass
+        except BaseException:
+            job.abandoned = True
+            raise
+        if job.error is not None:
+            raise job.error
+        return job.output
+
+    def shut_down(self) -> None:
+        """Refuse new jobs, and give a running one a little time to finish before exit."""
+        with self._lock:
+            self._closed = True
+            running = self._running
+        if running is not None:
+            running.done.wait(PDFIUM_EXIT_WAIT_S)
+
+    def _submit(self, job: _PdfiumJob) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("the PDFium worker has shut down")
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._serve, name="pdftext-pdfium", daemon=True
+                )
+                self._thread.start()
+            self._jobs.put(job)
+
+    def _serve(self) -> None:
+        while True:
+            job = self._jobs.get()
+            with self._lock:
+                skip = job.abandoned or self._closed
+                if not skip:
+                    self._running = job
+            if skip:
+                job.error = RuntimeError("repair was abandoned")
+            else:
+                try:
+                    job.run()
+                except Exception as exc:
+                    job.error = exc
+                finally:
+                    with self._lock:
+                        self._running = None
+            job.done.set()
+
+
+_pdfium_worker = _PdfiumWorker()
+# Registered after pypdfium2 is imported, so it runs before pypdfium2's own exit handler.
+atexit.register(_pdfium_worker.shut_down)
+
+
+def _repair_and_start(stream: _Stream, limits: Limits) -> _Start:
     """Rewrite the file through PDFium in memory, and open the result.
 
     Never `pdfplumber.open(repair=True)`, which runs Ghostscript as a subprocess.
     """
     try:
         stream.seek(0)
-        data = stream.read()
+        data = stream.read(limits.max_file_bytes + 1)
     except OSError as exc:
         raise InvalidPdfError("cannot read input file") from exc
-    repaired = BytesIO()
+    if len(data) > limits.max_file_bytes:
+        raise LimitExceededError("input file is too large")
     try:
-        pdfium_document = pypdfium2.PdfDocument(data)
-        try:
-            pdfium_document.save(repaired)
-        finally:
-            pdfium_document.close()
+        repaired = _pdfium_worker.repair(data)
     except pypdfium2.PdfiumError as exc:
         raise InvalidPdfError("input is not a valid PDF") from exc
     try:
-        return _start(repaired)
-    except InvalidPdfError:
+        return _start(repaired, limits)
+    except (InvalidPdfError, LimitExceededError):
         raise
     except Exception as exc:
         raise InvalidPdfError("input is not a valid PDF") from exc
@@ -268,7 +512,7 @@ def _walk_tree(doc: PDFDocument) -> Iterator[_Entry]:
         reference, parent_attrs = pending.pop()
         try:
             node = _load_node(doc, reference, parent_attrs, visited)
-        except Exception as exc:
+        except (Exception, StructureTimeout) as exc:
             # A branch that fails becomes one failed entry for its whole subtree.
             yield _Entry(exc)
             continue
@@ -319,7 +563,7 @@ def _scan_for_pages(doc: PDFDocument) -> Iterator[_Entry]:
 def _page_entry(doc: PDFDocument, object_id: int | None, attrs: dict[str, Any]) -> _Entry:
     try:
         return _Entry(PDFPage(doc, object_id, attrs, None))
-    except Exception as exc:
+    except (Exception, StructureTimeout) as exc:
         return _Entry(exc)
 
 

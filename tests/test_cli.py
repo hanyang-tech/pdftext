@@ -120,6 +120,19 @@ class TestMain:
 
         assert stop.value.code == 2
 
+    @pytest.mark.parametrize("option", ["--page-timeout", "--total-timeout"])
+    @pytest.mark.parametrize("bad", ["inf", "Infinity"])
+    def test_rejects_an_infinite_timeout_because_it_would_switch_the_limit_off(
+        self, capsys, option, bad
+    ):
+        with pytest.raises(SystemExit) as stop:
+            main(["in.pdf", "-o", "out", option, bad])
+
+        assert stop.value.code == 2
+        assert stderr_lines(capsys)[0] == [
+            f"pdftext: error: argument {option}: must be positive and finite"
+        ]
+
     def test_passes_the_limit_options_on_to_the_conversion(self, monkeypatch):
         seen = {}
 
