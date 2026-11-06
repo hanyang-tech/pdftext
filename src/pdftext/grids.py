@@ -1,12 +1,13 @@
 """Ruled tables: turn cell boxes into a forest of grids and place characters in it.
 
-Pure stage (PAT-3). The edge-to-edge slice replaces the `collapse` stub.
+Pure stage (PAT-3).
 """
 
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from typing import NamedTuple
 
 from pdftext.model import BBox, Figure, GridCell, GridNode, RawChar, union_bbox
 
@@ -14,6 +15,9 @@ from pdftext.model import BBox, Figure, GridCell, GridNode, RawChar, union_bbox
 GRID_PRECISION = 2
 # A box lies inside a cell if it leaves it by no more than this many points.
 CONTAINMENT_TOLERANCE = 0.5
+# The outer grid of a collapse, and each inferred subgrid, has at least two rows and two
+# columns, which take three lines in each direction.
+MIN_OUTER_LINES = 3
 
 # Where a cell sits in a forest: the index of a root grid, then alternately the index of a
 # cell in that grid and of a child grid in that cell, ending on a cell.
@@ -38,50 +42,95 @@ def make_grid(boxes: tuple[BBox, ...], *, inferred: bool = False) -> GridNode:
     return GridNode(union_bbox(boxes), xs, ys, tuple(cells), inferred)
 
 
-def collapse(grid: GridNode) -> GridNode | None:
-    return None
+def collapse(grid: GridNode, *, max_levels: int) -> GridNode | None:
+    """Read a grid that touches its parent cell's borders as nested tables, or return None.
+
+    The lines no cell crosses are the outer table's. Each outer cell holding several cells
+    becomes an inferred subgrid, which must be at least 2x2 and plain, or collapse in turn.
+    It is all or nothing: if any part fails, or the levels needed pass `max_levels`, the
+    grid is left as it is, flat with its spans. The result has the grid's own bbox.
+    """
+    if max_levels < 2 or not _fills_exactly(grid) or _is_plain(grid):
+        return None
+    col_lines = _outer_lines(len(grid.xs) - 1, ((cell.col, cell.colspan) for cell in grid.cells))
+    row_lines = _outer_lines(len(grid.ys) - 1, ((cell.row, cell.rowspan) for cell in grid.cells))
+    if len(col_lines) < MIN_OUTER_LINES or len(row_lines) < MIN_OUTER_LINES:
+        return None
+
+    members: defaultdict[tuple[int, int], list[GridCell]] = defaultdict(list)
+    for cell in grid.cells:
+        outer_position = (
+            bisect_right(row_lines, cell.row) - 1,
+            bisect_right(col_lines, cell.col) - 1,
+        )
+        members[outer_position].append(cell)
+
+    outer_cells = []
+    for (row, col), group in sorted(members.items()):
+        if len(group) == 1:
+            outer_cells.append(replace(group[0], row=row, col=col, rowspan=1, colspan=1))
+            continue
+        subgrid = _inferred_subgrid(group, max_levels=max_levels - 1)
+        if subgrid is None:
+            return None
+        outer_cells.append(
+            GridCell(subgrid.bbox, row, col, 1, 1, children=(subgrid,), chars=(), figures=())
+        )
+    return GridNode(
+        grid.bbox,
+        tuple(grid.xs[line] for line in col_lines),
+        tuple(grid.ys[line] for line in row_lines),
+        tuple(outer_cells),
+        grid.inferred,
+    )
 
 
 def build_forest(grids: tuple[tuple[BBox, ...], ...], *, max_depth: int) -> tuple[GridNode, ...]:
     """Nest grids by containment: each goes into the smallest cell that holds it.
 
-    A grid deeper than `max_depth` is dropped, so its text falls to the enclosing cell.
+    Every table level counts toward `max_depth`, inferred levels included. A grid that would
+    be deeper is dropped, so its text falls to the enclosing cell. A grid whose collapse
+    needs more levels than are left stays flat.
     """
-    nodes = [_collapsed_or_flat(boxes) for boxes in grids if boxes]
-    largest_first = sorted(range(len(nodes)), key=lambda index: _placement_key(nodes, index))
+    flat_grids = [make_grid(boxes) for boxes in grids if boxes]
+    largest_first = sorted(
+        range(len(flat_grids)), key=lambda index: _placement_key(flat_grids, index)
+    )
 
     placed: list[GridNode] = []  # a grid's parent always comes before it
     depths: list[int] = []
     roots: list[int] = []
-    grids_in_cell: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
+    grids_in_cell: defaultdict[tuple[int, CellPath], list[int]] = defaultdict(list)
     for index in largest_first:
-        node = nodes[index]
-        parent_cell = _smallest_cell_holding(placed, node.bbox)
-        depth = 1 if parent_cell is None else depths[parent_cell[0]] + 1
+        flat = flat_grids[index]
+        holder = _smallest_holder(placed, depths, flat.bbox)
+        depth = 1 if holder is None else holder.depth + 1
         if depth > max_depth:
             continue
-        if parent_cell is None:
+        if holder is None:
             roots.append(len(placed))
         else:
-            grids_in_cell[parent_cell].append(len(placed))
-        placed.append(node)
+            grids_in_cell[holder.position, holder.path].append(len(placed))
+        collapsed = collapse(flat, max_levels=max_depth - depth + 1)
+        placed.append(flat if collapsed is None else collapsed)
         depths.append(depth)
 
-    def assemble(position: int) -> GridNode:
-        node = placed[position]
-        cells = tuple(
-            replace(
-                cell,
-                children=(
-                    *cell.children,
-                    *(assemble(child) for child in grids_in_cell[(position, cell_index)]),
-                ),
+    def assemble(position: int, node: GridNode, path: CellPath = ()) -> GridNode:
+        """`node` with the grids placed in its cells, each cell's inferred subgrid first."""
+        cells = []
+        for cell_index, cell in enumerate(node.cells):
+            cell_path = (*path, cell_index)
+            inferred = tuple(
+                assemble(position, subgrid, (*cell_path, subgrid_index))
+                for subgrid_index, subgrid in enumerate(cell.children)
             )
-            for cell_index, cell in enumerate(node.cells)
-        )
-        return replace(node, cells=cells)
+            floating = tuple(
+                assemble(child, placed[child]) for child in grids_in_cell[position, cell_path]
+            )
+            cells.append(replace(cell, children=(*inferred, *floating)))
+        return replace(node, cells=tuple(cells))
 
-    return tuple(assemble(position) for position in roots)
+    return tuple(assemble(position, placed[position]) for position in roots)
 
 
 def populate(
@@ -128,10 +177,38 @@ def _line_index(lines: tuple[float, ...], coordinate: float) -> int:
     return bisect_left(lines, round(coordinate, GRID_PRECISION))
 
 
-def _collapsed_or_flat(boxes: tuple[BBox, ...]) -> GridNode:
-    grid = make_grid(boxes)
-    collapsed = collapse(grid)
-    return grid if collapsed is None else collapsed
+def _is_plain(grid: GridNode) -> bool:
+    return all(cell.rowspan == 1 and cell.colspan == 1 for cell in grid.cells)
+
+
+def _fills_exactly(grid: GridNode) -> bool:
+    """True if the cells cover every grid position once: no hole, overlap or empty span."""
+    positions_count = (len(grid.xs) - 1) * (len(grid.ys) - 1)
+    if any(cell.rowspan < 1 or cell.colspan < 1 for cell in grid.cells):
+        return False
+    if sum(cell.rowspan * cell.colspan for cell in grid.cells) != positions_count:
+        return False
+    covered = {
+        (row, col)
+        for cell in grid.cells
+        for row in range(cell.row, cell.row + cell.rowspan)
+        for col in range(cell.col, cell.col + cell.colspan)
+    }
+    return len(covered) == positions_count
+
+
+def _outer_lines(count: int, spans: Iterable[tuple[int, int]]) -> list[int]:
+    """The line indexes, of `count` + 1 lines, that no (start, span) crosses, the edges included."""
+    crossed = {line for start, span in spans for line in range(start + 1, start + span)}
+    return [line for line in range(count + 1) if line not in crossed]
+
+
+def _inferred_subgrid(members: Sequence[GridCell], *, max_levels: int) -> GridNode | None:
+    """The cells of one outer cell as an inferred grid, if it is a table of at least 2x2."""
+    subgrid = make_grid(tuple(member.bbox for member in members), inferred=True)
+    if len(subgrid.xs) < MIN_OUTER_LINES or len(subgrid.ys) < MIN_OUTER_LINES:
+        return None
+    return subgrid if _is_plain(subgrid) else collapse(subgrid, max_levels=max_levels)
 
 
 def _area(box: BBox) -> float:
@@ -158,19 +235,44 @@ def _centre(box: BBox) -> BBox:
     return BBox(x, y, x, y)
 
 
-def _smallest_cell_holding(placed: Sequence[GridNode], box: BBox) -> tuple[int, int] | None:
-    """The (grid, cell) indexes of the smallest-area cell holding `box`, if any."""
-    holding = [
-        (_area(cell.bbox), grid_index, cell_index)
-        for grid_index, node in enumerate(placed)
-        if _holds(node.bbox, box)
-        for cell_index, cell in enumerate(node.cells)
-        if _holds(cell.bbox, box)
-    ]
-    if not holding:
-        return None
-    _, grid_index, cell_index = min(holding)
-    return grid_index, cell_index
+class _Holder(NamedTuple):
+    """A cell that holds a box, in a placed grid or in an inferred subgrid below it.
+
+    `min` over holders picks the smallest cell, then the earlier-placed grid, then the
+    shallower cell. The first three fields name one cell, so `depth` never decides.
+    """
+
+    area: float
+    position: int
+    path: CellPath  # cell and subgrid indexes down from the placed grid's top level
+    depth: int  # of the grid that holds the cell, counting inferred levels
+
+
+def _holders(
+    node: GridNode, position: int, depth: int, box: BBox, path: CellPath = ()
+) -> Iterator[_Holder]:
+    for cell_index, cell in enumerate(node.cells):
+        if not _holds(cell.bbox, box):
+            continue
+        cell_path = (*path, cell_index)
+        yield _Holder(_area(cell.bbox), position, cell_path, depth)
+        for subgrid_index, subgrid in enumerate(cell.children):
+            yield from _holders(subgrid, position, depth + 1, box, (*cell_path, subgrid_index))
+
+
+def _smallest_holder(
+    placed: Sequence[GridNode], depths: Sequence[int], box: BBox
+) -> _Holder | None:
+    """The cell, at any level of any placed grid, that holds `box` in the least area."""
+    return min(
+        (
+            holder
+            for position, node in enumerate(placed)
+            if _holds(node.bbox, box)
+            for holder in _holders(node, position, depths[position], box)
+        ),
+        default=None,
+    )
 
 
 @dataclass(frozen=True, slots=True)

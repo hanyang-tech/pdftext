@@ -36,7 +36,7 @@ def compose_page(raw: RawPage, *, max_table_depth: int) -> Page:
     forest, free_chars, free_figures = populate(forest, chars, figures)
 
     size = median(char.size for char in chars) if chars else DEFAULT_CHAR_SIZE
-    tables = tuple(_table_from_grid(node, size) for node in forest)
+    tables = tuple(_table_from_grid(node, size, 1, max_table_depth) for node in forest)
     blocks = order_blocks(group_lines(free_chars), tables, free_figures, size=size)
 
     return Page(
@@ -70,7 +70,8 @@ def _cell_order(grid_cell: GridCell) -> tuple[int, int, int, BBox]:
     return grid_cell.col, grid_cell.colspan, grid_cell.rowspan, grid_cell.bbox
 
 
-def _table_from_grid(node: GridNode, size: float) -> Table:
+def _table_from_grid(node: GridNode, size: float, depth: int, max_depth: int) -> Table:
+    """The table for `node`, which is `depth` tables deep, the root being 1."""
     column_count = len(node.xs) - 1
     row_count = len(node.ys) - 1
     cells_by_row: list[list[GridCell]] = [[] for _ in range(row_count)]
@@ -78,7 +79,7 @@ def _table_from_grid(node: GridNode, size: float) -> Table:
         cells_by_row[grid_cell.row].append(grid_cell)
 
     rows = tuple(
-        _row_from_cells(node, index, sorted(grid_cells, key=_cell_order), size)
+        _row_from_cells(node, index, sorted(grid_cells, key=_cell_order), size, depth, max_depth)
         for index, grid_cells in enumerate(cells_by_row)
     )
     return Table(
@@ -90,17 +91,29 @@ def _table_from_grid(node: GridNode, size: float) -> Table:
     )
 
 
-def _row_from_cells(node: GridNode, index: int, grid_cells: list[GridCell], size: float) -> Row:
+def _row_from_cells(
+    node: GridNode,
+    index: int,
+    grid_cells: list[GridCell],
+    size: float,
+    depth: int,
+    max_depth: int,
+) -> Row:
     """A row's box is its band joined with the cells that start in it, so a rowspan stays inside."""
     band = BBox(node.bbox.x0, node.ys[index], node.bbox.x1, node.ys[index + 1])
-    cells = tuple(_cell_from_grid_cell(grid_cell, size) for grid_cell in grid_cells)
+    cells = tuple(
+        _cell_from_grid_cell(grid_cell, size, depth, max_depth) for grid_cell in grid_cells
+    )
     return Row(union_bbox([band, *(cell.bbox for cell in cells)]), index, cells)
 
 
-def _cell_from_grid_cell(grid_cell: GridCell, size: float) -> Cell:
-    tables = tuple(_table_from_grid(child, size) for child in grid_cell.children)
+def _cell_from_grid_cell(grid_cell: GridCell, size: float, depth: int, max_depth: int) -> Cell:
+    """A cell of a table `depth` deep. A text table inside it would be one level deeper."""
+    tables = tuple(
+        _table_from_grid(child, size, depth + 1, max_depth) for child in grid_cell.children
+    )
     lines = group_lines(grid_cell.chars)
-    if not tables:
+    if not tables and depth < max_depth:
         text_table = detect_text_table(lines)
         if text_table is not None:
             tables, lines = (text_table,), ()
