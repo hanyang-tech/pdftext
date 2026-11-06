@@ -2,12 +2,12 @@
 
 - **Branch:** `sdlc/pdf-layout-xml` (base: `main`; both unborn until the first commit)
 - **Iteration:** 3 of max 5
-- **Lanes:** iteration 2: lanes a, b, c merged (`3903359`, `2709725`, `7dd2585`); worktrees removed. Iteration 3: design delta for #18, #20, #21 approved; lane c (test-only part of #7) in fix round 2 in `pdf-layout-xml-03c` from `0ebb073` (reviewer r1 2 MAJOR on test strength, tester r1 PASS); lanes a (#7 limits with #20, #21, #9) and b (#4 with #18) being planned
+- **Lanes:** iteration 2: lanes a, b, c merged (`3903359`, `2709725`, `7dd2585`); worktrees removed. Iteration 3: design delta `372a95f`; lanes c, b, a merged as `5349f46`, `f4d8d18`, `3881fe6`; worktrees removed at Integrate.
 - **Gates:** requirements ✅ approved 2026-11-05 · design ✅ approved 2026-11-05 · release ⏳
 - **Mode:** interactive · verify: auto
 
 ## Checks
-All through `uv run`, all passing on `7dd2585`. The full suite (642 tests) takes about 3 s.
+All through `uv run`, all passing on `3881fe6`. The full suite (981 tests) takes about 67 s, most of it the real-time limit tests and the 200-page benchmark.
 - test (full suite): `uv run pytest`
 - test (targeted): `uv run pytest <paths>`
 - lint: `uv run ruff check .`
@@ -58,7 +58,7 @@ All through `uv run`, all passing on `7dd2585`. The full suite (642 tests) takes
 | PAT-4 | must | `src/pdftext/xmlwriter.py` (user-confirmed it. 1) | AC-22 test | confirmed |
 
 ## Acceptance criteria and invariants
-Verified by the full-suite run on `7dd2585` (iteration 2 merged), 642 tests. Rows from iteration 1 were verified on `f6a1bde` and pass again here:
+Verified by the full-suite run on `3881fe6` (iteration 3 merged), 981 tests. Rows from iterations 1 and 2 pass again here:
 
 | ID | Status | Verified by |
 |---|---|---|
@@ -86,15 +86,31 @@ Verified by the full-suite run on `7dd2585` (iteration 2 merged), 642 tests. Row
 | AC-19 | ✅ | `tests/test_repair.py::TestRefusedInput::test_gives_one_line_exit_two_and_no_document`, `TestFirstPageFault::test_exits_three_for_a_dangling_first_page_through_the_command` (it. 2a) |
 | AC-20 | ✅ | `tests/test_repair.py::TestEncryptedInput` (it. 2a) |
 | AC-21 | ✅ | `tests/test_repair.py::TestRepairThroughPdfium::test_a_broken_cross_reference_table_gives_the_output_of_the_undamaged_file` (it. 2a) |
-| SEC-7 | 🟡 | floating route: `tests/test_tables.py::TestDeepNesting`, `TestDeepNestingOutput` (it. 2b). Reworded it. 3: edge-to-edge and text-detected routes and the `--max-table-depth 1` clause open until #4 |
+| SEC-7 | ✅ | `tests/test_nesting.py::TestDeepNesting` (all three routes, whole-or-flat at 15/16/17), `TestInferredNesting::test_keeps_the_table_flat_when_the_limit_leaves_no_room_for_the_inner_one`, `tests/test_nesting_edges.py`, `tests/test_tables.py::TestDeepNestingOutput` (it. 2b, 3b) |
 | SEC-8 | ✅ | `tests/test_page_failures.py::TestErrorMessages::test_a_message_names_only_the_exception_class_whatever_its_text_says`, `tests/test_parser_logging.py` (it. 2a) |
 | SEC-14 | ✅ | `tests/test_page_failures.py::TestNonFiniteGeometry`, `TestImageGeometry` (it. 2a) |
-| SEC-15 | 🟡 | `tests/test_repair.py::TestEncryptedInput::test_never_sends_encrypted_input_to_pdfium`, `TestRepairThroughPdfium::test_never_calls_pdfium_for_a_file_that_opens_normally` (it. 2a). Over-limit clause and the it. 3 "encrypted" clauses open until #7 |
-| SEC-16 | 🟡 | dangling `/MediaBox` clause: `tests/test_page_failures.py::TestPageDictFaults::test_a_dangling_media_box_is_an_error_page_and_the_rest_are_read` (it. 2a). Cycle clauses open until #7 |
+| SEC-15 | ✅ | `tests/test_repair.py::TestEncryptedInput`, `TestRepairThroughPdfium::test_never_calls_pdfium_for_a_file_that_opens_normally` (it. 2a); `tests/test_pdfium_worker.py::TestPdfiumIsNotUsedForInputItMustRefuse`, `tests/test_encrypted_input.py::TestMalformedEncrypt`, `TestNullEncrypt`, `TestNoStateCarriesOverBetweenFiles`, `tests/test_stream_limit.py::TestARootStreamOverTheLimit` (it. 3a) |
+| SEC-16 | ✅ | `tests/test_page_failures.py::TestPageDictFaults::test_a_dangling_media_box_is_an_error_page_and_the_rest_are_read` (it. 2a); `tests/test_structure_timeouts.py::TestCycleInThePageTreeRoot`, `TestCycleInOnePage` (it. 3a) |
 | SEC-17 | ✅ | `tests/test_page_failures.py::TestPageTreeEntryFaults`, `tests/test_repair.py::TestFirstPageFault` (it. 2a) |
 | INV-2 | ✅ | `tests/test_tables.py::TestFixtures::test_keeps_every_child_inside_its_parent_or_marks_the_parent` (it. 2b) |
+| AC-14 | ✅ | `tests/test_nesting.py::TestInferredNesting::test_reads_fixture_b_as_a_table_in_the_bottom_right_cell_of_another`, `test_marks_only_the_inferred_table_in_the_xml`; fixture E flat: `tests/test_collapse.py::TestWhatStaysFlat` (it. 3b) |
+| AC-15 | ✅ | `tests/test_nesting_edges.py::TestFixtureF` (child of the cell, 4 rows, no blank rows, joined text, `detection="text"`) (it. 3b) |
+| AC-16 | ✅ | `tests/test_text_table.py::TestWhenThereIsNoTable`, `tests/test_nesting_edges.py` prose page of `nested.pdf` (it. 3b) |
+| AC-23 | ✅ | `tests/test_performance.py::test_converts_200_dense_pages_in_under_a_minute` (about 8 s), `test_peak_memory_does_not_grow_with_the_page_count`, `test_the_timed_conversion_wrote_every_page_with_all_of_its_text` (it. 3c) |
+| AC-25 | ✅ | `tests/test_limits_run.py::TestDefaults` and every limit class there; `tests/test_cli.py` limit options, `inf` and `nan` refused (it. 3a) |
+| SEC-1 | ✅ | `tests/test_limits_run.py::TestStreamThatInflatesPastTheLimit::test_gives_an_error_page_for_a_4_gib_content_stream_and_leaves_the_rest_normal` (it. 3a) |
+| SEC-2 | ✅ | `tests/test_limits_run.py::TestPageTimeout::test_gives_an_error_page_within_three_seconds_for_a_billion_draws` (it. 3a) |
+| SEC-3 | ✅ | `tests/test_limits_run.py::TestPageTimeout::test_exits_two_with_one_line_when_the_main_thread_is_stuck_in_a_c_call` (it. 3a) |
+| SEC-4 | ✅ | `tests/test_limits_run.py::TestMemoryLimit`, `tests/test_watchdog.py` memory tests (it. 3a) |
+| SEC-5 | ✅ | `tests/test_limits_run.py::TestSizeAndPageCountLimits`, `tests/test_pdfium_worker.py::TestPdfiumIsNotUsedForInputItMustRefuse` (it. 3a) |
+| SEC-6 | ✅ | `tests/test_limits_run.py::TestCharacterLimit` (to 3M chars at the defaults, and under a 64 MiB memory limit), `TestCharacterLimitsOfRunsAtOnce` (it. 3a) |
+| SEC-12 | ✅ | `tests/test_isolation.py::TestConversionStaysInsideTheSandbox`, `TestWhatTheProbeReports`, `TestTheProbeSeesRealEvents` (it. 3c) |
+| SEC-13 | ✅ | `tests/test_isolation.py::TestCraftedFontEncodingName` (it. 3c) |
+| SEC-18 | ✅ | `tests/test_pdfium_worker.py::TestStoppedWhileRepairing`, `TestWorkerShutDown`, `TestAbandonedJob` (it. 3a) |
+| SEC-19 | ✅ | `tests/test_pdfium_worker.py::TestSeveralThreadsRepairingAtOnce`, `tests/test_stream_limit.py::TestTwoRunsAtOnce` (it. 3a) |
+| INV-3 | ✅ | `tests/test_isolation.py::TestConversionStaysInsideTheSandbox` (normal, repaired, invalid inputs) (it. 3c) |
 
-AC-14 to AC-16 (#4), AC-23, AC-25, SEC-1 to SEC-6, SEC-12, SEC-13, SEC-18, SEC-19 and INV-3 (#7) are ⬜ open, with the open clauses of SEC-7 (#4), SEC-15 and SEC-16 (#7). See `requirements.md`.
+Every acceptance criterion and invariant in `requirements.md` is ✅ (AC-1 to AC-25, SEC-1 to SEC-19, INV-1 to INV-3).
 
 ## Log
 - 2026-11-05 Parser decision changed from pdf.js to pdfplumber, with Python, at the user's condition. Evidence in `parser-evaluation.md`.
@@ -105,3 +121,13 @@ AC-14 to AC-16 (#4), AC-23, AC-25, SEC-1 to SEC-6, SEC-12, SEC-13, SEC-18, SEC-1
 - 2026-11-06 Iteration 3 started at Design: architect delta for #18, #20, #21 (report `iterations/03/architect-delta.md`).
 - 2026-11-06 Architect delta READY (20 min): PDFium worker thread, `/Encrypt`-in-trailer rule, depth over every table level; SEC-7 and SEC-15 reworded, SEC-18 and SEC-19 proposed. Lane c started before the gate.
 - 2026-11-06 Design gate approved by the user. SEC-7 and SEC-15 reworded, SEC-18 and SEC-19 added in `requirements.md`; SEC-7 back to 🟡 for its new routes. Lane c in fix round 2 (two MAJOR test-strength findings).
+- 2026-11-06 Plan done at 01:01Z: lanes a and b planned from `372a95f` (`iterations/03a.md`, `03b.md`); both engineers started. Lane a owns `tests/pdfgen.py` this iteration, so lane b keeps its fixture builders in its own test files.
+- 2026-11-06 Lane c closed in 41 min (2 rounds; delta reviewer APPROVED, delta tester PASS) and merged as `5349f46`. 5 MINORs and 2 test-strength follow-ups to backlog #22 to #28. Driver settled: creating the output directory's missing parents doesn't break INV-3 (#28 rewords it later).
+- 2026-11-06 Lane b closed in 22 min (2 rounds) and merged as `f4d8d18`. The reviewer's one MAJOR (AC-15 test checked only depth and type) was a test gap the tester's independent file already closed, so the driver routed the tester's commit to a delta review instead of an engineer round; reviewer APPROVED. Driver ran `ruff format` on the tester's file (MINOR #6). 5 MINORs and unspecified cases to backlog #29 to #33. Driver settled: library `max_table_depth <= 0` to be rejected when limits are next validated (#33); `RecursionError` at about 300 floating levels with a very large limit stays a page error, as at base.
+- 2026-11-06 Lane a engineer done at 01:21Z (20 min, 16 files +2002 −63); rejects `--page-timeout inf`; asks verify to confirm its reading of SEC-18's "exits within 2 s".
+- 2026-11-06 Lane a verify round 1: reviewer CHANGES_REQUESTED. BLOCKER: an over-limit stream in page 1's entry sends the file to PDFium repair. MAJOR: a late stop can leave the watchdog armed. MAJOR: the SEC-16 root-cycle spy can't fail. 1 MINOR. Tester PASS with 27 new cases, committed `b4aeba8` after the driver fixed formatting and lint. Both raise SEC-18's "exits within 2 s" reading. Fix round 2 sent at 01:38Z. Design issues to the user: SEC-18 wording; the memory limit firing before the char limit at the defaults; the page-1 repair rule and PDFium's unbounded object-stream inflate.
+- 2026-11-06 Lane a verify round 2 at 01:53Z: delta reviewer APPROVED (all three resolved, no new findings), delta tester PASS (5 new cases, `0283b10`). Backlog #34 to #40 added, #9 closed. Lane close held for the user's design answers.
+- 2026-11-06 Lane a design gate at 04:02Z: the user accepted all three recommended answers. SEC-18 reworded (`main` exits 2 within 2 s, the process may end up to `PDFIUM_EXIT_WAIT_S` later); default `max_chars_per_page` 1,000,000 → 200,000 so SEC-6 holds before the memory limit; page-1 rule names over-limit faults, PDFium's uncapped repair-path inflate is threat row 22 (accepted), backlog #41. `requirements.md` and `design.md` updated. Engineer round 3 from 04:03Z for the default and backlog #34's bound.
+- 2026-11-06 Lane a round 3 at 04:12Z: delta tester PASS; delta reviewer CHANGES_REQUESTED with a BLOCKER: the char limit is checked only after every char is built, so a 1.5M-char page still ends the run at the memory limit with the new default. Fix round 4 from 04:12Z counts chars during parsing (a new adapter-private wrapper on pdfplumber's `render_char`), keeping the user's decision 2 true.
+- 2026-11-06 Lane a round 4 at 04:21Z: delta reviewer APPROVED (BLOCKER resolved; 2 MINORs → #42), delta tester PASS (3 new tests, `66b781d`). Verify done after 4 rounds. Driver note: Risk 6 lists the `render_char` wrapper as a fifth private seam. Backlog #34 closed, #42 and #43 added.
+- 2026-11-06 Lane a closed and merged as `3881fe6` (4 rounds, 12 reports, 0 send-backs). Integrate on `3881fe6`: 981 tests pass, scanners clean; every criterion and invariant in `requirements.md` is ✅. Worktrees 03a to 03c removed.
