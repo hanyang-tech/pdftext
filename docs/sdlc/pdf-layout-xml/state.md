@@ -3,7 +3,7 @@
 - **Branch:** `sdlc/pdf-layout-xml` (base: `main`; both unborn until the first commit)
 - **Iteration:** 3 of max 5
 - **Lanes:** iteration 2: lanes a, b, c merged (`3903359`, `2709725`, `7dd2585`); worktrees removed. Iteration 3: design delta `372a95f`; lanes c, b, a merged as `5349f46`, `f4d8d18`, `3881fe6`; worktrees removed at Integrate.
-- **Phase:** Iteration 5 (from 2026-11-06, backlog #63): 2 Design, architect delta for the ASCII85 hang and threat row 3 from 17:10Z. Iteration 4 done: lanes a and b merged (`5ff6a0f`, `c04dbf3`), full suite 1195 passed, DECISION CONTINUE
+- **Phase:** Iteration 5 (from 2026-11-06, backlog #63): Design approved at the gate (17:50Z): linear ASCII85 strip under a limit, SIGALRM alarm for `hard_stop=True` on the main thread, residual gap accepted as Risk 14; SEC-3 split, SEC-20 added. Next: 3 Plan, one lane (5a). Iteration 4 done: lanes a and b merged (`5ff6a0f`, `c04dbf3`), full suite 1195 passed, DECISION CONTINUE
 - **Gates:** requirements ✅ approved 2026-11-05 · design ✅ approved 2026-11-05 · release ⏳
 - **Mode:** interactive · verify: auto
 
@@ -101,7 +101,7 @@ Verified by the full-suite run on `3881fe6` (iteration 3 merged), 981 tests. Row
 | AC-25 | 🟡 | limit clauses: `tests/test_limits_run.py::TestDefaults` (32 MiB stream default) and every limit class there, `tests/test_decode_filters.py::TestAStreamAtTheLimit`; `tests/test_cli.py` limit options, `inf` and `nan` refused (it. 3a, 4a). "Never a hang" fails: a 1 MB whitespace ASCII85 stream hangs the run in a GIL-holding regex, so no timeout or hard stop fires (backlog #63, `must`) |
 | SEC-1 | ✅ | every route: `tests/test_limits_run.py::TestStreamThatInflatesPastTheLimit` (nine 4 GiB bombs through the CLI: Flate, RunLength, LZW, ASCII85, chains, CCITTFax, PNG predictor), `tests/test_decode_filters.py::TestEveryBombIsRefusedBecauseOfTheLimit`, `TestAPredictor`, `tests/test_stream_limit.py::TestStreamsMetWhileOpening` (it. 4a) |
 | SEC-2 | ✅ | `tests/test_limits_run.py::TestPageTimeout::test_gives_an_error_page_within_three_seconds_for_a_billion_draws` (it. 3a) |
-| SEC-3 | ✅ | `tests/test_limits_run.py::TestPageTimeout::test_exits_two_with_one_line_when_the_main_thread_is_stuck_in_a_c_call` (it. 3a) |
+| SEC-3 | 🟡 | reworded in iteration 5 into (a) and (b). (b) is today's `tests/test_limits_run.py::TestPageTimeout::test_exits_two_with_one_line_when_the_main_thread_is_stuck_in_a_c_call` (it. 3a), whose prelude must become a SIGALRM-masked libc `sleep`; (a) has no test yet (lane 5a) |
 | SEC-4 | ✅ | `tests/test_limits_run.py::TestMemoryLimit`, `tests/test_watchdog.py` memory tests (it. 3a) |
 | SEC-5 | ✅ | `tests/test_limits_run.py::TestSizeAndPageCountLimits`, `tests/test_pdfium_worker.py::TestPdfiumIsNotUsedForInputItMustRefuse` (it. 3a) |
 | SEC-6 | ✅ | `tests/test_limits_run.py::TestCharacterLimit` (to 3M chars at the defaults, and under a 64 MiB memory limit), `TestCharacterLimitsOfRunsAtOnce` (it. 3a) |
@@ -109,9 +109,10 @@ Verified by the full-suite run on `3881fe6` (iteration 3 merged), 981 tests. Row
 | SEC-13 | ✅ | `tests/test_isolation.py::TestCraftedFontEncodingName` (it. 3c) |
 | SEC-18 | ✅ | `tests/test_pdfium_worker.py::TestStoppedWhileRepairing`, `TestWorkerShutDown`, `TestAbandonedJob` (it. 3a) |
 | SEC-19 | ✅ | `tests/test_pdfium_worker.py::TestSeveralThreadsRepairingAtOnce`, `tests/test_stream_limit.py::TestTwoRunsAtOnce` (Flate, RunLength, LZW) and `TestTheLimitIsRestored`, `tests/test_decode_filters.py::TestTheSeam` (no limit: pdfminer's originals) (it. 3a, 4a) |
+| SEC-20 | ⬜ | added in iteration 5 (lane 5a) |
 | INV-3 | ✅ | `tests/test_isolation.py::TestConversionStaysInsideTheSandbox` (normal, repaired, invalid inputs) (it. 3c) |
 
-46 of 47 rows are ✅ on `c04dbf3`. SEC-1 is back to ✅ (every decode route bounded, iteration 4a). AC-25 went to 🟡 in iteration 4: lane a's reviewer found that a whitespace ASCII85 stream hangs the run in pdfminer's GIL-holding marker regexes, where neither the page timeout nor the hard stop can fire (backlog #63, older than iteration 4).
+46 of 48 rows were ✅ on `c04dbf3`; iteration 5's design gate reworded SEC-3 (now 🟡 until its case (a) has a test) and added SEC-20, so 45 of 48 are ✅ until lane 5a lands. SEC-1 is back to ✅ (every decode route bounded, iteration 4a). AC-25 went to 🟡 in iteration 4: lane a's reviewer found that a whitespace ASCII85 stream hangs the run in pdfminer's GIL-holding marker regexes, where neither the page timeout nor the hard stop can fire (backlog #63, older than iteration 4).
 
 ## Log
 - 2026-11-05 Parser decision changed from pdf.js to pdfplumber, with Python, at the user's condition. Evidence in `parser-evaluation.md`.
@@ -139,3 +140,4 @@ Verified by the full-suite run on `3881fe6` (iteration 3 merged), 981 tests. Row
 - 2026-11-06 Iteration 4 design gate: the user accepted all four recommended answers. `max_stream_bytes` default 32 MiB; CCITTFax refused under a limit; content-parser amplification accepted under threat row 4, backlog #60; SEC-1 and SEC-19 reworded in `requirements.md`. Driver changed `design.md` C3 to "bounded decode filters". Lane b fix round 2 (`e21cb06`, memory test on the traced heap) in delta review and test. Lane a engineer (software-engineer, sonnet) from 16:35Z.
 - 2026-11-06 Lane b round 2: reviewer APPROVED (2 minor → #61, #62), tester PASS (memory test 14 of 14; 13 KiB leak caught). Lane checks and scanners pass; squashed and cherry-picked as `5ff6a0f`; `design.md` AC-23 row updated. Lane a engineer done 16:47Z (`fd238bf`, contract check passed); SEC-1 sizes clarified by the driver (ASCII85 and ASCIIHex alone can't reach 4 GiB within the file limit). Lane a reviewer (code-reviewer, opus) and tester (general-purpose, sonnet) from 16:52Z.
 - 2026-11-06 Lane a round 1: reviewer APPROVED (2 minor; #1 is an older ASCII85 hang, confirmed by the driver: 80 KB of whitespace takes 10 s in pdfminer's marker regexes, which hold the GIL) → #63 (`must`, design) and #64; tester PASS. Lane checks and scanners pass; squashed `9587475`, cherry-picked as `c04dbf3`. Integrate: README `--max-stream-bytes` row to 32 MiB; full suite 1195 passed, 1 skipped in 93 s; scanners clean. SEC-1 ✅, AC-25 🟡 (#63). Retro: CONTINUE. Iteration 5 starts at Design with an architect delta for #63.
+- 2026-11-06 Iteration 5 Design: architect delta `iterations/05/architect-delta.md` (17:12Z–17:43Z, contract check passed). The user approved all three recommended answers: alarm only for `hard_stop=True` on the main thread; residual GIL gap accepted and named (Risk 14, threat row 3); SEC-3 split into (a) and (b), SEC-20 added. Applied to `design.md` and `requirements.md`.
