@@ -1,0 +1,24 @@
+RESULT: PASS
+CRITERIA:
+| ID | Test(s) | Existing or new | Result | Cause if failing |
+| AC-23 memory clause (a clean run passes reliably; a leak of 13 KB a page or more fails) | tests/test_performance.py::test_peak_memory_does_not_grow_with_the_page_count (now compares the tracemalloc heap peak at 25 and 100 pages, bound 1.05) | existing (rewritten by the engineer in e21cb06) | pass: 14 of 14 whole-file runs (8 idle, 6 with every core busy); 13,312 bytes a page leak fails 3 of 3, 0 bytes passes 2 of 2 | none |
+| AC-23 time clause (J200 under a minute) | tests/test_performance.py::test_converts_200_dense_pages_in_under_a_minute | existing | pass 14 of 14 (J200 untraced, so tracing does not slow it) | none |
+| AC-23 output (timed run wrote every page with all its text) | tests/test_performance.py::test_the_timed_conversion_wrote_every_page_with_all_of_its_text | existing | pass 14 of 14 | none |
+| Script behaviours 1 to 7 and README | not re-run in this round; unchanged since tester-r1 (commit 5a459c7). convert_probe.py is used only by tests/test_performance.py (grep over tests/, src/, scripts/) | n/a | see tester-r1.md | none |
+EDGE CASES TESTED: (leak probe: a scratch copy of the test pointed at a scratch probe that wraps `xmlwriter.OutputDir.write` and keeps memory per `page-*` written; scratch files are in the scratchpad `tester-04b/leak2/`, nothing committed)
+- 13,312 bytes (13 KiB) a page in the Python heap from page 1 → test FAILS, 3 of 3 (e.g. `assert 9991987 < (8936656 * 1.05)`, ratio about 1.118).
+- 0 bytes through the same probe → test PASSES, 2 of 2.
+- 13,312 bytes a page starting after page 25 → FAILS (9658202 against a limit of 9150132; the 100-page run holds 75 leaking pages).
+- 13,312 bytes a page starting after page 50 → FAILS (9323876 against a limit of 9149947; the 100-page run holds 50 leaking pages). So a leak that starts late is seen if it starts before about page 50 or so; the later it starts the larger it must be.
+- 13,312 bytes a page starting after page 100 → PASSES. Not seen: neither probe (25 and 100 pages) converts a page past 100. The engineer's note ("a leak that only begins after 100 pages is not seen") is confirmed.
+- 13,312 bytes a page held outside the Python heap (libc `malloc` + `memset` through ctypes) → PASSES; also 1,000,000 bytes a page held that way PASSES. Not seen: tracemalloc only counts allocations through the Python allocator. This confirms the engineer's note. It also weakens the old RSS check: native memory in the parent process (lxml's libxml2 and any C extension) is outside the measure now. A leak through PDFium would not have been seen before either (its own process).
+- `convert_probe.py` given an unknown flag after the output folder (reading the code, not run): `flags == ["--trace-heap"]` is false, so the flag is ignored and the report has no `heap_peak`, so the test would raise KeyError rather than say the flag was wrong. Cosmetic: the test always passes the flag it needs.
+- Two probes at once (`heap_peaks` starts both, then waits): both complete; with every core busy the file took 43 to 54 s and still passed 6 of 6.
+UNSPECIFIED:
+- How big a leak, and starting when, the memory clause must catch · the test catches a heap leak of about 5.5 KiB a page or more from the start (engineer's figure: 6 KiB gave 1.057; I measured 13 KiB at 1.118), and none that starts after page 100 or that is held in native memory · AC-23 in requirements.md and the lane file say "a leak of 13 KB a page or more still fails" without saying whether it must be seen at any page number or in native memory. For the stated 13 KB figure, from page 1, the test meets it.
+COVERAGE: no coverage tool applies (test files and a probe script only; not measured).
+TESTS RUN: `uv run pytest tests/test_performance.py -q -p no:cacheprovider` 14 times, 3 tests each: 8 times with the machine idle (29.5 to 30.5 s each, load average about 1.6 to 3.6 from other work), 6 times with 12 busy-loop processes on 12 cores (42.6 to 54.2 s each). Plus 10 leak-probe runs of the memory test alone on the scratch copy (about 20.5 s each). The earlier tests/test_convert_script.py was not re-run. `uv run ruff format --check` and `ruff check` on the two changed files pass.
+REGRESSIONS: none
+FLAKY: none · 14 of 14 whole-file runs passed (8 idle, 6 with every core busy); the engineer reported 23 of 23 as well, so 37 of 37 together · added or touched by this slice: yes (the file was rewritten) · no failing run to show. The file is now 29.5 to 30.5 s idle and up to 54 s with every core busy, against 15 to 18 s before this change, so it is the slowest file by a larger margin.
+FAILURES: none
+TEST FILES: no test added or changed in this round (tests/test_performance.py and tests/convert_probe.py are the engineer's, commit e21cb06; nothing to commit from me). The only commit of mine remains 5a459c7 (tests/test_convert_script.py).

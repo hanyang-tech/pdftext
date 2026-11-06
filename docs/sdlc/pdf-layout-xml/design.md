@@ -453,7 +453,7 @@ Exception to note, within the rules: the watchdog, the shim, the `_initialize_pa
 | AC-19, AC-20 | `open_document` classification, with the encryption record for AC-20, C11 exit 2, `OutputDir.prepare` |
 | AC-21 | PDFium repair path on the worker, also tried for a failed first page-tree entry of input that isn't encrypted |
 | AC-22 | PAT-4, total sort keys, fixed precision; `PYTHONHASHSEED` test |
-| AC-23 | Lazy pages with caching off: 9 to 20 s for J200 across noisy runs; subprocess peak RSS test J50 vs J200 |
+| AC-23 | Lazy pages with caching off: 9 to 20 s for J200 across noisy runs, timed untraced. Memory: the traced Python-heap peak (tracemalloc) of 25 against 100 dense pages, ratio < 1.05 (clean 1.003 to 1.004; a 13 KiB-a-page leak gives 1.118). It doesn't see memory a C library allocates for itself (small on this path: zlib state; PDFium runs only on repair), nor growth that starts after page 100 (a one-off step of about 1 MB between 100 and 150 pages, then about 0.5 to 1 KB a page up to 400). Replaced the RSS test in iteration 4 lane b, which failed clean runs under load |
 | AC-24 | `sanitize_chars`, ElementTree, `replaced-chars` |
 | AC-25 | C2, including the watchdog over `open_document` and each `advance`, the bounded decode filters, `max_pages`, `max_file_bytes`. Defaults in `Limits`, `max_stream_bytes` 32 MiB (AC-25 defaults) |
 | SEC-1 (revision proposed) | Bounded decode filters at `max_stream_bytes`, for every filter and predictor `PDFStream.decode` applies, per stage of a chain, with `decompress_corrupted` too. CCITTFax refused under a limit. The page boundary turns a refusal into that page's error page; at open, the catalog rule gives exit 2 before PDFium |
