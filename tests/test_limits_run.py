@@ -70,7 +70,7 @@ class TestDefaults:
             page_timeout_s=30.0,
             total_timeout_s=1800.0,
             max_memory_bytes=2 << 30,
-            max_stream_bytes=256 << 20,
+            max_stream_bytes=32 << 20,
             max_chars_per_page=200_000,
             max_table_depth=16,
         )
@@ -78,16 +78,41 @@ class TestDefaults:
         assert limits.DEFAULT_GRACE_S == 3.0
 
 
+MIB = 1 << 20
+# Each of these gives a content stream that is far over the 32 MiB default, from a file that can be
+# read. A plain ASCII85 stream of 4 GiB would need a 1 GiB file, so it is 256 MiB from 64 MiB, and
+# 4 GiB of ASCII85 is the Flate one.
+BOMBS = {
+    "flate": lambda: pdfgen.EncodedStream(pdfgen.inflating_content(b"", 4 * GIB), ("FlateDecode",)),
+    "run-length": lambda: pdfgen.run_length_bomb(4 * GIB),
+    "lzw": lambda: pdfgen.lzw_bomb(4 * GIB),
+    "ascii85": lambda: pdfgen.ascii85_bomb(256 * MIB),
+    "flate-then-ascii85": lambda: pdfgen.EncodedStream(
+        pdfgen.repeated_flate(b"z", GIB), ("FlateDecode", "ASCII85Decode")
+    ),
+    "flate-then-run-length": lambda: pdfgen.EncodedStream(
+        pdfgen.repeated_flate(b"\x81 ", 64 * MIB), ("FlateDecode", "RunLengthDecode")
+    ),
+    "ascii-hex-then-flate": lambda: pdfgen.EncodedStream(
+        pdfgen.inflating_content(b"", 4 * GIB).hex().encode() + b">",
+        ("ASCIIHexDecode", "FlateDecode"),
+    ),
+    "ccitt": pdfgen.ccitt_stream,
+    "png-predictor-over-a-huge-width": lambda: pdfgen.predictor_bomb(GIB),
+}
+
+
 class TestStreamThatInflatesPastTheLimit:
     """SEC-1"""
 
-    def test_gives_an_error_page_for_a_4_gib_content_stream_and_leaves_the_rest_normal(
-        self, tmp_path
+    @pytest.mark.parametrize("make_bomb", BOMBS.values(), ids=BOMBS)
+    def test_gives_an_error_page_for_a_stream_that_decodes_to_gigabytes_and_leaves_the_rest_normal(
+        self, tmp_path, make_bomb
     ):
         objects = pdfgen.build_objects(pdfgen.numbered_pages(3))
-        pdfgen.with_inflating_content(objects, 1, 4 * GIB)
+        pdfgen.with_encoded_content(objects, 1, make_bomb())
         source = write_objects(tmp_path, objects)
-        assert len(objects[pdfgen.content_object_id(1)]) < 8 << 20  # it is a bomb, not a big file
+        assert source.stat().st_size < 100 * MIB  # it is a bomb, not a big file
         out = tmp_path / "out"
 
         run = run_cli([source, "-o", out])
@@ -99,6 +124,45 @@ class TestStreamThatInflatesPastTheLimit:
         assert words(out, 3) == ["PAGE3"]
         assert run.peak_rss is not None
         assert run.peak_rss < GIB
+
+    def test_gives_an_error_page_for_a_truncated_stream_over_a_limit_of_one_mib(self, tmp_path):
+        objects = pdfgen.build_objects(pdfgen.numbered_pages(3))
+        pdfgen.with_truncated_content(objects, 1, 2 * MIB)
+        source = write_objects(tmp_path, objects)
+        out = tmp_path / "out"
+
+        run = run_cli([source, "-o", out, "--max-stream-bytes", str(MIB)])
+
+        assert run.returncode == 3
+        assert [page_status(out, number) for number in (1, 2, 3)] == ["ok", "error", "ok"]
+
+    def test_reads_a_truncated_stream_that_is_just_under_the_limit_within_the_memory_bound(
+        self, tmp_path
+    ):
+        # pdfminer's retry for a stream like this held 64 times its output, 2 GiB for this one.
+        objects = pdfgen.build_objects(pdfgen.numbered_pages(3))
+        pdfgen.with_truncated_content(objects, 1, 31 * MIB)
+        source = write_objects(tmp_path, objects)
+        out = tmp_path / "out"
+
+        run = run_cli([source, "-o", out])
+
+        assert run.returncode == 0
+        assert [page_status(out, number) for number in (1, 2, 3)] == ["ok", "ok", "ok"]
+        assert words(out, 2) == ["PAGE2"]
+        assert run.peak_rss is not None
+        assert run.peak_rss < GIB
+
+    def test_reads_a_truncated_stream_that_decodes_to_under_a_limit_of_one_mib(self, tmp_path):
+        objects = pdfgen.build_objects(pdfgen.numbered_pages(3))
+        pdfgen.with_truncated_content(objects, 1, MIB // 2)
+        source = write_objects(tmp_path, objects)
+        out = tmp_path / "out"
+
+        run = run_cli([source, "-o", out, "--max-stream-bytes", str(MIB)])
+
+        assert run.returncode == 0
+        assert words(out, 2) == ["PAGE2"]
 
     def test_the_error_page_has_a_message_from_the_closed_vocabulary(self, tmp_path):
         objects = pdfgen.build_objects(pdfgen.numbered_pages(2))
@@ -118,6 +182,15 @@ class TestStreamThatInflatesPastTheLimit:
         bomb = pdfgen.inflating_content(cmap, 4 << 20)
         objects[4] = b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(bomb) + bomb
         objects[4] += b"\nendstream"
+        source = write_objects(tmp_path, objects)
+
+        pages = list(pdftext.iter_pages(source, limits=Limits(max_stream_bytes=1 << 20)))
+
+        assert [page.status.value for page in pages] == ["error", "error"]
+
+    def test_a_run_length_bomb_in_a_font_stream_gives_error_pages(self, tmp_path):
+        objects = pdfgen.build_objects(pdfgen.numbered_pages(2))
+        objects[4] = pdfgen.run_length_bomb(4 << 20).as_object()  # the ToUnicode map
         source = write_objects(tmp_path, objects)
 
         pages = list(pdftext.iter_pages(source, limits=Limits(max_stream_bytes=1 << 20)))

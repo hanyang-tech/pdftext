@@ -23,7 +23,7 @@ class Limits:
     page_timeout_s: float = 30.0
     total_timeout_s: float = 1800.0
     max_memory_bytes: int = 2 << 30  # 2 GiB of peak RSS growth since open
-    max_stream_bytes: int = 256 << 20  # 256 MiB per decompressed stream
+    max_stream_bytes: int = 32 << 20  # 32 MiB per stream, after each filter and predictor
     # Counted as the characters are built (see the adapter). About 2.5 KB of peak RSS per char puts
     # a page at this limit near 480 MiB, so it ends well before the memory limit would.
     max_chars_per_page: int = 200_000

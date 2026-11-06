@@ -5,23 +5,24 @@ and closes the page. Nothing it returns refers back to pdfminer, pdfplumber or p
 """
 
 import atexit
+import base64
 import logging
 import math
 import queue
 import threading
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BufferedReader, BytesIO
 from itertools import chain
 from pathlib import Path
-from types import SimpleNamespace, TracebackType
-from typing import Any, NamedTuple, Self
+from types import ModuleType, SimpleNamespace, TracebackType
+from typing import Any, NamedTuple, NoReturn, Self
 
 import pdfplumber
 import pypdfium2  # type: ignore[import-untyped]  # ships no type information
-from pdfminer import pdftypes
+from pdfminer import ascii85, ccitt, lzw, pdftypes, runlength, utils
 from pdfminer.pdfdocument import PDFDocument, PDFEncryptionError
 from pdfminer.pdfexceptions import PDFException, PDFObjectNotFound
 from pdfminer.pdfpage import LITERAL_PAGE, LITERAL_PAGES, PDFPage
@@ -60,6 +61,22 @@ class _StreamLimit(threading.local):
 
 
 _stream_limit = _StreamLimit()
+_RUN_LENGTH_END = 128  # the length byte that ends a RunLength stream
+_PDF_WHITESPACE = b" \t\n\r\f\v"  # what pdfminer's hex decoder skips
+_ASCII85_IGNORED = b" \t\n\r\v"  # what `base64.a85decode` skips
+_ASCII85_SLICE = 5 << 18  # digits decoded per call: 1.25 MiB, a whole number of groups of 5
+
+
+def _refuse() -> NoReturn:
+    raise LimitExceededError("a stream is too large")
+
+
+# Bounded decode filters. `PDFStream.decode` looks each filter up by name in `pdftypes` at call
+# time, so replacing those names bounds every route a stream can be decoded by (Risk 6). Each
+# replacement reads this thread's limit, and with none set calls pdfminer's original unchanged, so
+# a host's own pdfminer use is as if pdftext weren't imported.
+#
+# Bounded while decoding, so no more than the limit (plus one chunk) is ever produced.
 
 
 def _bounded_decompress(data: bytes) -> bytes:
@@ -70,17 +87,187 @@ def _bounded_decompress(data: bytes) -> bytes:
     decompressor = zlib.decompressobj()
     inflated = decompressor.decompress(data, max_bytes + 1)
     if len(inflated) > max_bytes:
-        raise LimitExceededError("a stream is too large")
+        _refuse()
     if not decompressor.eof:
         raise zlib.error("incomplete or truncated stream")  # as `zlib.decompress` does
     return inflated
 
 
-# The zlib C call can't be interrupted, so pdfminer's use of it is bounded from the inside
-# (Risk 6). The limit is per thread, so a host's own pdfminer use stays unbounded.
-pdftypes.zlib = SimpleNamespace(  # type: ignore[attr-defined,assignment]
-    decompress=_bounded_decompress, decompressobj=zlib.decompressobj, error=zlib.error
+def _bounded_decompress_corrupted(data: bytes) -> bytes:
+    """pdfminer's retry for Flate data that fails its checksum, with the limit.
+
+    The loop and the rule that an error in the last 3 bytes is ignored are pdfminer's. Its result
+    grows by `bytes +=`, which costs about 64 times the output in memory.
+    """
+    max_bytes = _stream_limit.max_bytes
+    if max_bytes is None:
+        return _PDFMINER_FILTERS["decompress_corrupted"](data)
+    decompressor = zlib.decompressobj()
+    inflated = bytearray()
+    index = 0
+    try:
+        for index in range(len(data)):
+            inflated += decompressor.decompress(data[index : index + 1])
+            if len(inflated) > max_bytes:
+                _refuse()
+    except zlib.error:
+        if index < len(data) - 3:
+            raise
+        pdftypes.logger.warning("Data-loss while decompressing corrupted data")
+    return bytes(inflated)
+
+
+def _bounded_lzwdecode(data: bytes) -> bytes:
+    max_bytes = _stream_limit.max_bytes
+    if max_bytes is None:
+        return _PDFMINER_FILTERS["lzwdecode"](data)
+    chunks = []
+    size = 0
+    for chunk in lzw.LZWDecoder(BytesIO(data)).run():
+        size += len(chunk)
+        if size > max_bytes:
+            _refuse()
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+# Bounded before decoding, from the input, because pdfminer's decoders work in many times their
+# output (9 for RunLength and the predictors, 22 to 34 for ASCII85).
+
+
+def _run_length_size(data: bytes, max_bytes: int) -> int:
+    """The decoded size from the run headers alone, or more than `max_bytes` once it passes it."""
+    size = 0
+    position = 0
+    while position < len(data) and size <= max_bytes:
+        length = data[position]
+        if length == _RUN_LENGTH_END:
+            break
+        if length < _RUN_LENGTH_END:  # that many bytes plus one, copied
+            size += length + 1
+            position += length + 2
+        else:  # the next byte, repeated
+            size += 257 - length
+            position += 2
+    return size
+
+
+def _bounded_rldecode(data: bytes) -> bytes:
+    max_bytes = _stream_limit.max_bytes
+    if max_bytes is not None and _run_length_size(data, max_bytes) > max_bytes:
+        _refuse()
+    return _PDFMINER_FILTERS["rldecode"](data)
+
+
+def _count_hex_digits(data: bytes) -> int:
+    """The hex digits before the first `>`, as pdfminer reads them, without copying `data`."""
+    end = data.find(b">")
+    if end == -1:
+        end = len(data)
+    return end - sum(data.count(space, 0, end) for space in _PDF_WHITESPACE)
+
+
+def _bounded_asciihexdecode(data: bytes) -> bytes:
+    max_bytes = _stream_limit.max_bytes
+    if max_bytes is not None and (_count_hex_digits(data) + 1) // 2 > max_bytes:
+        _refuse()
+    return _PDFMINER_FILTERS["asciihexdecode"](data)
+
+
+def _decode_ascii85_slice(decoded: bytearray, digits: memoryview) -> None:
+    for start in range(0, len(digits), _ASCII85_SLICE):
+        decoded += base64.a85decode(digits[start : start + _ASCII85_SLICE])
+
+
+def _bounded_ascii85decode(data: bytes) -> bytes:
+    """Same bytes, or the same `ValueError`, as pdfminer's, in slices of a few MiB at a time.
+
+    pdfminer strips `<~`, `~>` and whitespace and makes one `a85decode` call, whose working memory
+    is a list per group. Here the output is sized first, then each run of digits between `z`s is
+    decoded in slices of whole groups, so that list never outgrows one slice.
+    """
+    max_bytes = _stream_limit.max_bytes
+    if max_bytes is None:
+        return _PDFMINER_FILTERS["ascii85decode"](data)
+    stripped = ascii85.end_re.sub(b"", ascii85.start_re.sub(b"", data))
+    digits = stripped.translate(None, _ASCII85_IGNORED)
+    zeros = digits.count(b"z")
+    others = len(digits) - zeros
+    # A `z` is 4 bytes, 5 digits are 4, and a last group of k digits is k - 1.
+    if 4 * zeros + 4 * (others // 5) + max(others % 5 - 1, 0) > max_bytes:
+        _refuse()
+    *before_zero, last_run = digits.split(b"z")
+    decoded = bytearray()
+    for run in before_zero:
+        whole_groups = len(run) - len(run) % 5
+        _decode_ascii85_slice(decoded, memoryview(run)[:whole_groups])
+        if whole_groups != len(run):
+            # A `z` in a group. Decoding the rest with it raises the error pdfminer's would.
+            base64.a85decode(run[whole_groups:] + b"z")
+        decoded += bytes(4)
+    _decode_ascii85_slice(decoded, memoryview(last_run))
+    return bytes(decoded)
+
+
+def _refuse_a_wide_or_big_predictor(columns: int, data: bytes) -> None:
+    """PNG's predictor builds 9 bytes per column before it reads any data, so `Columns` counts."""
+    max_bytes = _stream_limit.max_bytes
+    if max_bytes is not None and (len(data) > max_bytes or columns > max_bytes // 9):
+        _refuse()
+
+
+def _bounded_apply_png_predictor(
+    pred: int, colors: int, columns: int, bitspercomponent: int, data: bytes
+) -> bytes:
+    _refuse_a_wide_or_big_predictor(columns, data)
+    return _PDFMINER_FILTERS["apply_png_predictor"](pred, colors, columns, bitspercomponent, data)
+
+
+def _bounded_apply_tiff_predictor(
+    colors: int, columns: int, bitspercomponent: int, data: bytes
+) -> bytes:
+    _refuse_a_wide_or_big_predictor(columns, data)
+    return _PDFMINER_FILTERS["apply_tiff_predictor"](colors, columns, bitspercomponent, data)
+
+
+def _bounded_ccittfaxdecode(data: bytes, params: dict[str, object]) -> bytes:
+    """Refused under a limit: it is an image filter, and its memory is 13 to 67 times its output."""
+    if _stream_limit.max_bytes is not None:
+        _refuse()
+    return _PDFMINER_FILTERS["ccittfaxdecode"](data, params)
+
+
+class _DecodeFilter(NamedTuple):
+    name: str  # the global `PDFStream.decode` looks up in `pdfminer.pdftypes`
+    home: ModuleType  # where pdfminer's version is found before it is replaced
+    bounded: Any
+
+
+_DECODE_FILTERS = (
+    # The zlib C call can't be interrupted, so it is bounded from the inside.
+    _DecodeFilter(
+        "zlib",
+        pdftypes,
+        SimpleNamespace(
+            decompress=_bounded_decompress, decompressobj=zlib.decompressobj, error=zlib.error
+        ),
+    ),
+    _DecodeFilter("decompress_corrupted", pdftypes, _bounded_decompress_corrupted),
+    _DecodeFilter("lzwdecode", lzw, _bounded_lzwdecode),
+    _DecodeFilter("rldecode", runlength, _bounded_rldecode),
+    _DecodeFilter("asciihexdecode", ascii85, _bounded_asciihexdecode),
+    _DecodeFilter("ascii85decode", ascii85, _bounded_ascii85decode),
+    _DecodeFilter("ccittfaxdecode", ccitt, _bounded_ccittfaxdecode),
+    _DecodeFilter("apply_png_predictor", utils, _bounded_apply_png_predictor),
+    _DecodeFilter("apply_tiff_predictor", utils, _bounded_apply_tiff_predictor),
 )
+# What each name was before it was replaced. `zlib` is the module, and is called as `zlib` here.
+_PDFMINER_FILTERS: dict[str, Callable[..., bytes]] = {
+    decode_filter.name: getattr(decode_filter.home, decode_filter.name)
+    for decode_filter in _DECODE_FILTERS
+}
+for _decode_filter in _DECODE_FILTERS:
+    setattr(pdftypes, _decode_filter.name, _decode_filter.bounded)
 
 
 @contextmanager

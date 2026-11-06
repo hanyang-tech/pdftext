@@ -10,7 +10,7 @@ import hashlib
 import struct
 import zlib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import count
 
 GLYPH_WIDTH = 600  # every code is 0.6 em wide, so advances are easy to predict
@@ -234,16 +234,170 @@ def content_object_id(page_index: int) -> int:
     return page_object_id(page_index) + 1
 
 
+def _stream_data(objects: dict[int, bytes], number: int) -> bytes:
+    """The bytes between `stream` and `endstream` of an unfiltered stream object."""
+    _, _, rest = objects[number].partition(b"stream\n")
+    return rest.rpartition(b"\nendstream")[0]
+
+
 def with_inflating_content(objects: dict[int, bytes], page_index: int, inflated: int) -> None:
     """Make page `page_index`'s content stream inflate to `inflated` bytes, with its text kept."""
     number = content_object_id(page_index)
-    _, _, rest = objects[number].partition(b"stream\n")
-    content = rest.rpartition(b"\nendstream")[0]
+    content = _stream_data(objects, number)
     compressed = inflating_content(content, inflated - len(content))
     objects[number] = (
         b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(compressed)
         + compressed
         + b"\nendstream"
+    )
+
+
+def content_of(objects: dict[int, bytes], page_index: int) -> bytes:
+    """The unfiltered content stream of page `page_index`, as `build_objects` makes it."""
+    return _stream_data(objects, content_object_id(page_index))
+
+
+@dataclass(frozen=True)
+class EncodedStream:
+    """A stream as it sits in the file, with the filters that decode it, first to last.
+
+    `parms` is written as one `/DecodeParms` dictionary, which PDF applies to every filter in turn.
+    """
+
+    data: bytes
+    filters: tuple[str, ...]
+    parms: dict[str, int] = field(default_factory=dict)
+
+    def as_object(self, extra_entries: str = "") -> bytes:
+        names = " ".join(f"/{name}" for name in self.filters)
+        entries = f"{extra_entries} /Filter [{names}]"
+        if self.parms:
+            entries += " /DecodeParms << " + " ".join(f"/{k} {v}" for k, v in self.parms.items())
+            entries += " >>"
+        header = f"<< /Length {len(self.data)} {entries} >>\nstream\n".encode("ascii")
+        return header + self.data + b"\nendstream"
+
+
+def with_encoded_content(objects: dict[int, bytes], page_index: int, stream: EncodedStream) -> None:
+    """Make `stream` page `page_index`'s content stream, in place of its text."""
+    objects[content_object_id(page_index)] = stream.as_object()
+
+
+_FLATE_END_BYTES = 6  # the empty last block and the checksum, which `inflating_content` ends with
+
+
+def with_truncated_content(objects: dict[int, bytes], page_index: int, inflated: int) -> None:
+    """Make page `page_index`'s content a Flate stream cut short of its end, text kept.
+
+    It inflates to `inflated` bytes, as `with_inflating_content` makes, but the zlib call fails on
+    the missing end, so the reader falls back to decoding it a byte at a time.
+    """
+    number = content_object_id(page_index)
+    content = _stream_data(objects, number)
+    whole = inflating_content(content, inflated - len(content))
+    objects[number] = EncodedStream(whole[:-_FLATE_END_BYTES], ("FlateDecode",)).as_object()
+
+
+def repeated_flate(unit: bytes, size: int) -> bytes:
+    """A zlib stream that inflates to `size` bytes of `unit` repeated, at a few bytes per MiB.
+
+    `unit` must divide a MiB and `size` must be a whole number of units.
+    """
+    if _BLOCK % len(unit) or size % len(unit):
+        raise ValueError("`unit` must divide a MiB, and `size` must be a multiple of it")
+    compressor = zlib.compressobj(level=9, wbits=-15)
+    block = unit * (_BLOCK // len(unit))
+    full_blocks, rest = divmod(size, _BLOCK)
+    # A full flush resets the dictionary, so every block compresses to the same bytes.
+    packed_block = compressor.compress(block) + compressor.flush(zlib.Z_FULL_FLUSH)
+    tail = compressor.compress(block[:rest]) + compressor.flush(zlib.Z_FINISH)
+    checksum = 1
+    for _ in range(full_blocks):
+        checksum = zlib.adler32(block, checksum)
+    checksum = zlib.adler32(block[:rest], checksum)
+    return b"\x78\xda" + packed_block * full_blocks + tail + struct.pack(">I", checksum)
+
+
+def run_length_bomb(decoded: int, prefix: bytes = b"") -> EncodedStream:
+    """A RunLength stream of `prefix` and spaces to `decoded` bytes, from 2 bytes per 128 spaces."""
+    literals = b"".join(
+        bytes([len(piece) - 1]) + piece
+        for piece in (prefix[i : i + 128] for i in range(0, len(prefix), 128))
+    )
+    runs, rest = divmod(decoded - len(prefix), 128)
+    last_run = b"" if rest == 0 else b"\x00 " if rest == 1 else bytes([257 - rest]) + b" "
+    return EncodedStream(literals + b"\x81 " * runs + last_run + b"\x80", ("RunLengthDecode",))
+
+
+def ascii85_bomb(decoded: int) -> EncodedStream:
+    """An ASCII85 stream of `decoded` bytes (a multiple of 4), one `z` for each 4 of them."""
+    return EncodedStream(b"z" * (decoded // 4) + b"~>", ("ASCII85Decode",))
+
+
+_SPACE = 32
+_CLEAR = 256  # the LZW code that empties the table
+
+
+def lzw_bomb(decoded: int, prefix: bytes = b"") -> EncodedStream:
+    """An LZW stream of `prefix` and spaces to `decoded` bytes, long once its code table is full.
+
+    The codes after the first are each one longer than the last, until the table is full and one
+    code of 3,839 bytes repeats. Widths follow pdfminer's decoder: 9 bits, then 10, 11 and 12 as
+    its table grows by one entry for each code. The spaces start after a clear code.
+    """
+    codes = [_SPACE]
+    size = 1
+    code = 258
+    while code < 4096 and size + code - 256 <= decoded - len(prefix):  # 258 is two bytes, 259 three
+        codes.append(code)
+        size += code - 256
+        code += 1
+    while size + 3839 <= decoded - len(prefix):
+        codes.append(4095)
+        size += 3839
+    codes.extend([_SPACE] * (decoded - len(prefix) - size))
+    bits = [(_CLEAR, 9), *_lzw_widths(list(prefix))]
+    if prefix:
+        bits.append((_CLEAR, _lzw_width(len(prefix))))
+    bits.extend(_lzw_widths(codes))
+    return EncodedStream(_pack_bits(bits), ("LZWDecode",))
+
+
+def _lzw_widths(codes: list[int]) -> list[tuple[int, int]]:
+    return [(code, _lzw_width(index)) for index, code in enumerate(codes)]
+
+
+def _lzw_width(index: int) -> int:
+    """The bits of the code after `index` others, past the clear code."""
+    return 9 if index < 254 else 10 if index < 766 else 11 if index < 1790 else 12
+
+
+def _pack_bits(codes: list[tuple[int, int]]) -> bytes:
+    """`(value, width)` pairs written most significant bit first, the last byte zero padded."""
+    packed = bytearray()
+    pending = 0
+    pending_bits = 0
+    for value, width in codes:
+        pending = (pending << width) | value
+        pending_bits += width
+        while pending_bits >= 8:
+            pending_bits -= 8
+            packed.append((pending >> pending_bits) & 0xFF)
+        pending &= (1 << pending_bits) - 1
+    if pending_bits:
+        packed.append((pending << (8 - pending_bits)) & 0xFF)
+    return bytes(packed)
+
+
+def ccitt_stream() -> EncodedStream:
+    """A CCITT Group 4 stream, a filter for bilevel images that no content stream uses."""
+    return EncodedStream(b"\xff\xff", ("CCITTFaxDecode",), {"K": -1, "Columns": 8})
+
+
+def predictor_bomb(columns: int) -> EncodedStream:
+    """A few bytes of Flate with a PNG predictor over `columns` columns, which sizes its rows."""
+    return EncodedStream(
+        zlib.compress(bytes(16)), ("FlateDecode",), {"Predictor": 12, "Columns": columns}
     )
 
 
@@ -379,17 +533,24 @@ def build_pdf_with_catalog_in_object_stream(inflated: int) -> bytes:
 
 
 def build_pdf_with_object_in_object_stream(
-    number: int, inflated: int, pages: list[PageSpec]
+    number: int,
+    inflated: int,
+    pages: list[PageSpec],
+    encoded: EncodedStream | None = None,
 ) -> bytes:
     """A PDF made by `build_objects` whose object `number` is in an object stream.
 
-    The stream inflates to `inflated` bytes, so it is a bomb when `inflated` is large. The file
-    ends with a cross-reference stream, as a file with object streams does.
+    The stream inflates to `inflated` bytes, so it is a bomb when `inflated` is large. Or it is
+    `encoded`, which then holds the object, as given. The file ends with a cross-reference stream,
+    as a file with object streams does.
     """
     objects = build_objects(pages)
     body = objects.pop(number)
     header = b"%d 0 " % number
-    packed = inflating_content(header + body, inflated - len(header + body))
+    if encoded is None:
+        encoded = EncodedStream(
+            inflating_content(header + body, inflated - len(header + body)), ("FlateDecode",)
+        )
     stream_id = max(objects, default=0) + 1
     xref_id = stream_id + 1
     out = bytearray(b"%PDF-1.7\n")
@@ -399,10 +560,9 @@ def build_pdf_with_object_in_object_stream(
         out += b"%d 0 obj\n" % object_number + object_body + b"\nendobj\n"
     offsets[stream_id] = len(out)
     out += (
-        b"%d 0 obj\n<< /Type /ObjStm /N 1 /First %d /Filter /FlateDecode /Length %d >>\nstream\n"
-        % (stream_id, len(header), len(packed))
-        + packed
-        + b"\nendstream\nendobj\n"
+        b"%d 0 obj\n" % stream_id
+        + encoded.as_object(f"/Type /ObjStm /N 1 /First {len(header)}")
+        + b"\nendobj\n"
     )
     offsets[xref_id] = len(out)
     entries = bytearray(b"\x00\x00\x00\x00\x00\x00\xff")  # object 0, free

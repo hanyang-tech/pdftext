@@ -7,6 +7,8 @@ import zlib
 import pytest
 from pdfminer.pdfdocument import PDFDocument
 from pdfminer.pdfparser import PDFParser
+from pdfminer.pdftypes import PDFStream
+from pdfminer.psparser import LIT
 
 import pdfgen
 import pdftext
@@ -20,10 +22,22 @@ MIB = 1 << 20
 RUNS_PER_THREAD = 5
 
 
-@pytest.fixture
-def source_with_a_4_mib_stream(tmp_path):
+# Page 2's content is its own text and then spaces, to 4 MiB, encoded one way or another.
+FOUR_MIB_STREAMS = {
+    "flate": None,
+    "run-length": pdfgen.run_length_bomb,
+    "lzw": pdfgen.lzw_bomb,
+}
+
+
+@pytest.fixture(params=FOUR_MIB_STREAMS.values(), ids=FOUR_MIB_STREAMS)
+def source_with_a_4_mib_stream(tmp_path, request):
     objects = pdfgen.build_objects(pdfgen.numbered_pages(3))
-    pdfgen.with_inflating_content(objects, 1, 4 * MIB)
+    if request.param is None:
+        pdfgen.with_inflating_content(objects, 1, 4 * MIB)
+    else:
+        text = pdfgen.content_of(objects, 1)
+        pdfgen.with_encoded_content(objects, 1, request.param(4 * MIB, text))
     source = tmp_path / "input.pdf"
     source.write_bytes(pdfgen.serialise(objects))
     return source
@@ -79,6 +93,23 @@ class TestTwoRunsAtOnce:
         thread.join(30)
 
         assert decoded == [4 * MIB]
+
+    def test_a_ccitt_decode_on_a_third_thread_is_pdfminers_own(self, source_with_a_4_mib_stream):
+        # Under a limit it is refused, and nowhere else.
+        statuses(source_with_a_4_mib_stream, Limits(max_stream_bytes=MIB))
+        stream = pdfgen.ccitt_stream()
+        decoded = []
+
+        def decode_with_pdfminer_alone():
+            attributes = {"Filter": LIT("CCITTFaxDecode"), "DecodeParms": dict(stream.parms)}
+            decoded.append(PDFStream(attributes, stream.data).get_data())
+
+        thread = threading.Thread(target=decode_with_pdfminer_alone)
+        thread.start()
+        thread.join(30)
+
+        expected = adapter._PDFMINER_FILTERS["ccittfaxdecode"](stream.data, stream.parms)
+        assert decoded == [expected]
 
 
 class TestTheLimitIsRestored:
@@ -184,15 +215,20 @@ class TestStreamsMetWhileOpening:
         with pytest.raises(LimitExceededError, match="stream is too large"):
             list(pdftext.iter_pages(source, limits=Limits(max_stream_bytes=MIB)))
 
+    @pytest.mark.parametrize(
+        "encoded",
+        [None, pdfgen.run_length_bomb(4 * MIB), pdfgen.lzw_bomb(4 * MIB)],
+        ids=["flate", "run-length", "lzw"],
+    )
     def test_page_one_in_an_object_stream_over_the_limit_becomes_an_error_page_without_pdfium(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, encoded
     ):
         # Repair would rewrite the stream past the limit, on a thread nothing can interrupt.
         calls = record_pdfium_calls(monkeypatch)
         source = tmp_path / "input.pdf"
         source.write_bytes(
             pdfgen.build_pdf_with_object_in_object_stream(
-                pdfgen.page_object_id(0), 4 * MIB, pdfgen.numbered_pages(3)
+                pdfgen.page_object_id(0), 4 * MIB, pdfgen.numbered_pages(3), encoded
             )
         )
 
