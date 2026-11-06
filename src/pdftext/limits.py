@@ -3,17 +3,25 @@
 import ctypes
 import os
 import resource
+import signal
 import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import FrameType
 from typing import ClassVar
 
 STDERR_FD = 2
 HARD_STOP_EXIT_CODE = 2
 POLL_INTERVAL_S = 0.05
 DEFAULT_GRACE_S = 3.0
+# How often the alarm looks again, so that an early tick or a swallowed stop is tried once more.
+ALARM_REPEAT_S = 0.5
+# The longest first expiry. `setitimer` refuses a very long one (macOS: over 1e8 s), and a tick
+# before the deadline is ignored and tried again, so a longer limit just takes a few ticks.
+ALARM_MAX_S = 86_400.0
+_SignalHandler = Callable[[int, FrameType | None], object] | int | signal.Handlers | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +89,12 @@ class Watchdog:
     and the memory baseline start when the watchdog is made. With `hard_stop`, a thread that
     hasn't left its armed step `grace_s` after the first delivery (it is stuck in C code) ends
     the process with one line.
+
+    A `hard_stop` watchdog made on the main thread also arms a SIGALRM interval timer. The polling
+    thread can't run while another thread holds the GIL in one C call, such as a regex that checks
+    for signals as it goes. The timer's handler runs on the main thread, between that call's checks,
+    and raises the due stop there. It never ends the process: that stays the polling thread's job.
+    The handler that was installed before is restored by `stop`.
     """
 
     def __init__(
@@ -94,12 +108,24 @@ class Watchdog:
         self._lock = threading.Lock()
         self._armed: _Armed | None = None
         self._stopped = threading.Event()
+        self._alarm = hard_stop and threading.current_thread() is threading.main_thread()
+        self._previous_handler: _SignalHandler = None
         threading.Thread(target=self._poll, name="pdftext-watchdog", daemon=True).start()
+        if self._alarm:
+            self._previous_handler = signal.signal(signal.SIGALRM, self._on_alarm)
+            # After `signal.signal`, which makes system calls fail with EINTR again. A worker
+            # thread's calls, PDFium's included, must restart instead.
+            signal.siginterrupt(signal.SIGALRM, False)
 
     def arm(self, seconds: float, stop: type[LimitStop]) -> None:
         """Deliver `stop` into the calling thread if it is still armed after `seconds`."""
         with self._lock:
             self._armed = _Armed(threading.get_ident(), time.monotonic() + seconds, stop)
+        if self._alarm:
+            total_left = self._started_at + self._limits.total_timeout_s - time.monotonic()
+            # The timer counts real time and the deadline is monotonic, so a tick can come early.
+            first_expiry = max(min(seconds, total_left, ALARM_MAX_S), 1e-3)
+            signal.setitimer(signal.ITIMER_REAL, first_expiry, ALARM_REPEAT_S)
 
     def disarm(self) -> None:
         """Stop watching, and clear a stop that was delivered but not raised yet.
@@ -116,15 +142,24 @@ class Watchdog:
                 continue
 
     def _disarm_once(self) -> None:
+        if self._alarm:
+            signal.setitimer(signal.ITIMER_REAL, 0)  # before the lock, which the main thread wants
         with self._lock:
             armed, self._armed = self._armed, None
             # With nothing armed, a delivery may still be on its way to the calling thread.
             _deliver(threading.get_ident() if armed is None else armed.thread_id, None)
 
     def stop(self) -> None:
-        """End the polling thread. Call it when the run is over."""
+        """End the polling thread and put back the SIGALRM handler. Call it when the run is over."""
         self._stopped.set()
         self.disarm()
+        if self._alarm:
+            self._alarm = False
+            # `None` means a handler that Python didn't install, which can't be put back.
+            signal.signal(
+                signal.SIGALRM,
+                signal.SIG_DFL if self._previous_handler is None else self._previous_handler,
+            )
 
     def run[T](self, seconds: float, stop: type[LimitStop], step: Callable[[], T]) -> T:
         """Call `step` armed, and disarm however it ends.
@@ -160,6 +195,20 @@ class Watchdog:
             elif self._hard_stop and now - armed.first_delivery >= self._grace_s:
                 _hard_exit(due.message)
             _deliver(armed.thread_id, due)
+
+    def _on_alarm(self, signum: int, frame: FrameType | None) -> None:
+        """Raise the due stop in the main thread, if that is the armed one.
+
+        This runs between bytecodes of the main thread, which may hold `_lock`, so it reads
+        `_armed` without it and can't take it. It doesn't end the process either: a stop raised
+        here is deterministic, where a hard exit raced the stop it was about to replace.
+        """
+        armed = self._armed
+        if armed is None or armed.thread_id != threading.get_ident():
+            return
+        due = self._due_stop(armed, time.monotonic())
+        if due is not None:
+            raise due
 
     def _due_stop(self, armed: _Armed, now: float) -> type[LimitStop] | None:
         if peak_rss() - self._memory_baseline > self._limits.max_memory_bytes:

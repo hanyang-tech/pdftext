@@ -1,9 +1,12 @@
 """The watchdog on its own: when it delivers a stop, which one wins, and how it ends a stuck run."""
 
+import signal
 import threading
 import time
+from contextlib import contextmanager
 
 import pytest
+from pdfminer import ascii85
 
 from pdftext import limits
 from pdftext.limits import (
@@ -30,6 +33,19 @@ def make_watchdog():
     yield make
     for watchdog in made:
         watchdog.stop()
+
+
+@contextmanager
+def sigalrm_blocked():
+    """Model a C call that doesn't return on a signal: a SIGALRM sent meanwhile waits until the end.
+
+    A plain `time.sleep` returns early for a signal handler that raises, which the alarm now is.
+    """
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def busy_until_stopped():
@@ -246,7 +262,8 @@ class TestHardStop:
         """Stay in `time.sleep`, where no stop can reach the thread, then take the stop."""
         watchdog.arm(0.05, PageTimeout)
         try:
-            time.sleep(0.6)
+            with sigalrm_blocked():
+                time.sleep(0.6)
             time.sleep(0.05)  # a Python-level step, where the stop lands
         except PageTimeout:
             pass
@@ -294,7 +311,8 @@ class TestHardStop:
         watchdog = make_watchdog(limits_, hard_stop=True, grace_s=0.2)
         watchdog.arm(30, PageTimeout)
         try:
-            time.sleep(0.6)  # no stop can reach the thread in C code
+            with sigalrm_blocked():
+                time.sleep(0.6)  # no stop can reach the thread in C code
             time.sleep(0.05)
         except limits.LimitStop:
             pass
@@ -323,6 +341,235 @@ class TestHardStop:
 
         assert written == [(2, b"pdftext: error: page processing timed out\n")]
         assert exited == [2]
+
+
+class TestAlarm:
+    """SEC-3 (a): in the CLI, SIGALRM stops a C call that holds the GIL and checks signals."""
+
+    @pytest.fixture
+    def host_handler(self):
+        """A handler the host had before, which the watchdog must put back."""
+
+        def handler(signum, frame):
+            pass
+
+        original = signal.signal(signal.SIGALRM, handler)
+        yield handler
+        signal.signal(signal.SIGALRM, original)
+
+    def test_stops_a_regex_that_holds_the_gil_at_its_deadline(self, make_watchdog):
+        """The poll can't run meanwhile. Unstopped, the regex takes 5 s and the test fails."""
+        watchdog = make_watchdog(hard_stop=True)
+        started = time.monotonic()
+
+        with pytest.raises(PageTimeout):
+            watchdog.run(0.2, PageTimeout, lambda: ascii85.start_re.sub(b"", b" " * 80_000))
+
+        assert time.monotonic() - started < 0.7
+
+    def test_stops_nothing_and_leaves_no_timer_once_the_step_is_over(self, make_watchdog):
+        watchdog = make_watchdog(hard_stop=True)
+
+        watchdog.run(0.1, PageTimeout, lambda: None)
+
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+        time.sleep(0.7)  # past the deadline and a repeat: a timer left running would stop this
+
+    @pytest.mark.parametrize("seconds", [1e9, 1e10])
+    def test_runs_a_step_under_limits_too_long_for_the_timer_to_take(self, make_watchdog, seconds):
+        """`setitimer` refuses these as they are (macOS: over 1e8 s), so the expiry is capped."""
+        watchdog = make_watchdog(
+            Limits(page_timeout_s=seconds, total_timeout_s=seconds), hard_stop=True
+        )
+
+        result = watchdog.run(seconds, PageTimeout, lambda: signal.getitimer(signal.ITIMER_REAL)[0])
+
+        assert 0 < result <= limits.ALARM_MAX_S
+
+    def test_ignores_a_tick_that_comes_before_the_deadline(self, make_watchdog):
+        watchdog = make_watchdog(hard_stop=True)
+
+        def step():
+            signal.raise_signal(signal.SIGALRM)
+            return "done"
+
+        assert watchdog.run(30, PageTimeout, step) == "done"
+
+    def test_ignores_a_tick_when_nothing_is_armed(self, make_watchdog):
+        watchdog = make_watchdog(hard_stop=True)
+
+        watchdog._on_alarm(signal.SIGALRM, None)
+
+    def test_ignores_a_tick_when_another_thread_is_the_armed_one(self, make_watchdog):
+        watchdog = make_watchdog(hard_stop=True)
+        watchdog._armed = limits._Armed(threading.get_ident() + 1, 0.0, PageTimeout)
+
+        watchdog._on_alarm(signal.SIGALRM, None)
+
+        watchdog._armed = None
+
+    @pytest.mark.parametrize(
+        ("limits_", "stop"),
+        [
+            pytest.param(Limits(), PageTimeout, id="page"),
+            pytest.param(Limits(total_timeout_s=0.0), TotalTimeout, id="total"),
+            pytest.param(Limits(max_memory_bytes=-1), MemoryLimit, id="memory"),
+        ],
+    )
+    def test_raises_the_stop_the_poll_would_deliver_when_one_is_due(
+        self, make_watchdog, limits_, stop
+    ):
+        """Design, Alarm: the stop from the handler is the same one the poll delivers."""
+        watchdog = make_watchdog(limits_, hard_stop=True)
+        watchdog._armed = limits._Armed(threading.get_ident(), 0.0, PageTimeout)
+
+        try:
+            with pytest.raises(stop):
+                watchdog._on_alarm(signal.SIGALRM, None)
+        finally:
+            watchdog._armed = None
+
+    @pytest.mark.parametrize(
+        ("limits_", "seconds", "stop"),
+        [
+            pytest.param(Limits(), 0, PageTimeout, id="zero-seconds"),
+            pytest.param(Limits(), -1, PageTimeout, id="already-late"),
+            pytest.param(Limits(total_timeout_s=0.2), 30, TotalTimeout, id="total-is-nearer"),
+            pytest.param(Limits(total_timeout_s=0.0), 30, TotalTimeout, id="total-is-spent"),
+        ],
+    )
+    def test_still_stops_a_regex_when_the_time_left_is_zero_or_the_total_is_nearer(
+        self, make_watchdog, limits_, seconds, stop
+    ):
+        """A timer of 0 would mean no timer at all, and the regex would run for minutes."""
+        watchdog = make_watchdog(limits_, hard_stop=True)
+        started = time.monotonic()
+
+        with pytest.raises(stop):
+            watchdog.run(seconds, PageTimeout, lambda: ascii85.start_re.sub(b"", b" " * 80_000))
+
+        assert time.monotonic() - started < 0.7
+
+    def test_tries_again_when_the_code_swallowed_the_first_stop(self, make_watchdog):
+        """The repeat tick: parser code that catches the stop and goes on is stopped at the next."""
+        watchdog = make_watchdog(hard_stop=True)
+        caught = []
+
+        def step():
+            try:
+                ascii85.start_re.sub(b"", b" " * 80_000)
+            except PageTimeout:
+                caught.append(time.monotonic())
+            ascii85.start_re.sub(b"", b" " * 80_000)
+
+        started = time.monotonic()
+        with pytest.raises(PageTimeout):
+            watchdog.run(0.2, PageTimeout, step)
+
+        assert len(caught) == 1
+        assert time.monotonic() - started < 0.2 + limits.ALARM_REPEAT_S + 0.7
+
+    def test_stops_each_of_two_runs_in_turn(self, make_watchdog):
+        """State left from the first run (timer, armed record) must not spoil the second."""
+        watchdog = make_watchdog(hard_stop=True)
+
+        for _ in range(2):
+            started = time.monotonic()
+            with pytest.raises(PageTimeout):
+                watchdog.run(0.2, PageTimeout, lambda: ascii85.start_re.sub(b"", b" " * 80_000))
+            assert time.monotonic() - started < 0.7
+            assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+    def test_a_tick_while_a_worker_thread_is_the_armed_one_stops_the_worker_and_not_the_caller(
+        self, make_watchdog
+    ):
+        """Made on the main thread with `hard_stop`, armed on another: the handler lets it be."""
+        watchdog = make_watchdog(hard_stop=True)
+        outcome = []
+
+        def worker():
+            try:
+                watchdog.run(0.2, PageTimeout, busy_until_stopped)
+            except PageTimeout:  # pragma: no cover - `busy_until_stopped` returns the stop
+                outcome.append("raised")
+            else:
+                outcome.append("returned")
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(GIVE_UP_S)  # the tick lands here, on the main thread, and must do nothing
+
+        assert not thread.is_alive()
+        assert outcome == ["returned"]
+
+    def test_puts_back_the_default_action_when_the_previous_handler_was_not_python_code(
+        self, make_watchdog, monkeypatch
+    ):
+        real_signal = signal.signal
+        calls = []
+
+        def signal_without_a_python_previous(signum, handler):
+            previous = real_signal(signum, handler)
+            calls.append(handler)
+            return None if len(calls) == 1 else previous
+
+        monkeypatch.setattr(limits.signal, "signal", signal_without_a_python_previous)
+        watchdog = make_watchdog(hard_stop=True)
+
+        watchdog.stop()
+
+        assert calls[-1] is signal.SIG_DFL
+        monkeypatch.undo()
+        assert signal.getsignal(signal.SIGALRM) is signal.SIG_DFL
+
+    def test_stop_puts_back_the_handler_that_was_there_before(self, make_watchdog, host_handler):
+        watchdog = make_watchdog(hard_stop=True)
+        assert signal.getsignal(signal.SIGALRM) is not host_handler
+
+        watchdog.stop()
+
+        assert signal.getsignal(signal.SIGALRM) is host_handler
+
+    def test_stop_twice_puts_back_the_handler_once(self, make_watchdog, host_handler):
+        watchdog = make_watchdog(hard_stop=True)
+        watchdog.stop()
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)  # what the host does after the run
+
+        watchdog.stop()
+
+        assert signal.getsignal(signal.SIGALRM) is signal.SIG_IGN
+
+    def test_without_hard_stop_it_installs_no_handler_and_no_timer(
+        self, make_watchdog, host_handler
+    ):
+        watchdog = make_watchdog(hard_stop=False)
+        seen = {}
+
+        def step():
+            seen["handler"] = signal.getsignal(signal.SIGALRM)
+            seen["timer"] = signal.getitimer(signal.ITIMER_REAL)
+
+        watchdog.run(30, PageTimeout, step)
+
+        assert seen == {"handler": host_handler, "timer": (0.0, 0.0)}
+
+    def test_with_hard_stop_off_the_main_thread_it_installs_no_handler_and_no_timer(
+        self, make_watchdog, host_handler
+    ):
+        seen = {}
+
+        def armed_thread():
+            watchdog = make_watchdog(hard_stop=True)
+            watchdog.arm(30, PageTimeout)
+            seen["handler"] = signal.getsignal(signal.SIGALRM)
+            seen["timer"] = signal.getitimer(signal.ITIMER_REAL)
+            watchdog.disarm()
+
+        thread = threading.Thread(target=armed_thread)
+        thread.start()
+        thread.join(GIVE_UP_S)
+
+        assert seen == {"handler": host_handler, "timer": (0.0, 0.0)}
 
 
 class TestPeakRss:

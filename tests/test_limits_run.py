@@ -27,10 +27,44 @@ def compose_page(*args, **kwargs):
         pass
 api.compose_page = compose_page
 """
+# A C call that releases the GIL and doesn't return on a signal: SIGALRM is blocked around libc's
+# `sleep`. A plain `time.sleep` returns for the alarm's handler, which is a page error instead.
 STUCK_IN_C_PRELUDE = """
-import time
+import ctypes, signal
 from pdftext import api
-api.compose_page = lambda *args, **kwargs: time.sleep(60)
+def compose_page(*args, **kwargs):
+    signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGALRM])
+    ctypes.CDLL(None).sleep(60)
+api.compose_page = compose_page
+"""
+# One C call that holds the GIL and checks for signals as it goes: it takes minutes unstopped.
+# It is `start_re`, not `end_re`, on purpose. `end_re` is as slow, but its gap between signal checks
+# grows with the input: a handler first ran 2.7 s into `end_re.sub(b"", b" " * 400_000 + b"!")`,
+# then every 2.7 s, and 1.3 s into 200,000 spaces. A 2 s page would then end well after its
+# deadline. `start_re` checks at least every 0.5 s.
+GIL_HOLDING_REGEX_PRELUDE = """
+from pdfminer import ascii85
+from pdftext import api
+api.compose_page = lambda *args, **kwargs: ascii85.start_re.sub(b"", b" " * 400_000)
+"""
+# Appends how long each page's armed step took, in seconds, to the file named by PAGE_TIMES_FILE.
+# It wraps `Watchdog.run`, which has disarmed by the time it returns, so no stop can land in it.
+TIMES_EACH_PAGE_PRELUDE = """
+import os, time
+from pdftext import limits
+
+_run = limits.Watchdog.run
+
+def run(self, seconds, stop, step):
+    started = time.monotonic()
+    try:
+        return _run(self, seconds, stop, step)
+    finally:
+        if stop is limits.PageTimeout:
+            with open(os.environ["PAGE_TIMES_FILE"], "a") as times:
+                times.write(f"{time.monotonic() - started}\\n")
+
+limits.Watchdog.run = run
 """
 GROWS_THE_HEAP_PRELUDE = """
 import time
@@ -239,7 +273,34 @@ class TestPageTimeout:
         assert run.returncode == 2
         assert run.stderr == "pdftext: error: page processing timed out\n"
         assert not (out / "document.xml").exists()
+        assert not list(out.glob("page-*.xml"))
         assert run.seconds < page_timeout_s + limits.DEFAULT_GRACE_S + 1
+
+    def test_gives_every_page_an_error_when_each_is_stuck_in_a_gil_holding_call_that_checks_signals(
+        self, tmp_path, monkeypatch
+    ):
+        """SEC-3 (a): the polling thread can't run here, so the alarm stops the call."""
+        source = tmp_path / "input.pdf"
+        source.write_bytes(pdfgen.build_pdf(pdfgen.numbered_pages(3)))
+        out = tmp_path / "out"
+        page_times = tmp_path / "page-times.txt"
+        monkeypatch.setenv("PAGE_TIMES_FILE", str(page_times))
+        page_timeout_s = 2
+
+        run = run_cli(
+            [source, "-o", out, "--page-timeout", str(page_timeout_s)],
+            TIMES_EACH_PAGE_PRELUDE + GIL_HOLDING_REGEX_PRELUDE,
+        )
+
+        assert run.returncode == 3
+        assert run.stderr == ""
+        seconds_per_page = [float(line) for line in page_times.read_text().splitlines()]
+        assert len(seconds_per_page) == 3
+        assert all(page_timeout_s <= seconds < page_timeout_s + 1 for seconds in seconds_per_page)
+        for number in (1, 2, 3):
+            assert page_status(out, number) == "error"
+            message = parse_xml((out / f"page-{number:04d}.xml").read_bytes()).get("message")
+            assert message == "page processing timed out"
 
     def test_a_caller_slower_than_the_page_timeout_is_not_stopped_while_it_holds_a_page(
         self, tmp_path
@@ -253,6 +314,43 @@ class TestPageTimeout:
             statuses.append(page.status.value)
 
         assert statuses == ["ok", "ok", "ok"]
+
+
+class TestVeryLongTimeouts:
+    """A limit the command accepts must not break the run, however long it is."""
+
+    @pytest.mark.parametrize("seconds", ["1e9", "1e10"])
+    def test_converts_a_document_with_a_page_and_total_timeout_of_that_many_seconds(
+        self, tmp_path, seconds
+    ):
+        source = tmp_path / "input.pdf"
+        source.write_bytes(pdfgen.build_pdf(pdfgen.numbered_pages(3)))
+        out = tmp_path / "out"
+
+        run = run_cli([source, "-o", out, "--page-timeout", seconds, "--total-timeout", seconds])
+
+        assert run.returncode == 0
+        assert run.stderr == ""
+        assert [page_status(out, number) for number in (1, 2, 3)] == ["ok", "ok", "ok"]
+
+
+class TestWhitespaceAscii85:
+    """SEC-20, AC-25: pdfminer's strip of the markers took minutes on a megabyte of whitespace."""
+
+    def test_converts_a_stream_of_a_million_spaces_at_the_defaults(self, tmp_path):
+        objects = pdfgen.build_objects(pdfgen.numbered_pages(3))
+        stream = pdfgen.EncodedStream(b" " * 1_000_000 + b"!", ("ASCII85Decode",))
+        pdfgen.with_encoded_content(objects, 1, stream)
+        source = write_objects(tmp_path, objects)
+        out = tmp_path / "out"
+
+        run = run_cli([source, "-o", out])
+
+        assert run.returncode == 0
+        assert run.stderr == ""
+        assert run.seconds < 5
+        assert [page_status(out, number) for number in (1, 2, 3)] == ["ok", "no-text", "ok"]
+        assert (out / "document.xml").exists()
 
 
 class TestMemoryLimit:

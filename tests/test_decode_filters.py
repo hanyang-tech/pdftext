@@ -6,7 +6,10 @@ These decode one stream in this process. The page, thread and command tests are 
 
 import base64
 import inspect
+import itertools
 import random
+import subprocess
+import sys
 import zlib
 
 import pdfminer.ascii85
@@ -57,6 +60,7 @@ def pdfminer_alone(monkeypatch):
         with monkeypatch.context() as unpatched:
             for name, original in adapter._PDFMINER_FILTERS.items():
                 unpatched.setattr(pdftypes, name, original)
+            unpatched.setattr(pdftypes, "zlib", zlib)
             return stream_of(encoded).get_data()
 
     return decode
@@ -188,6 +192,15 @@ class TestACorruptedFlateStream:
         assert bounded == adapter._PDFMINER_FILTERS["decompress_corrupted"](packed)
         assert len(bounded) == 3 * MIB
 
+    def test_is_read_at_exactly_the_limit_and_refused_one_byte_over(self):
+        """AC-25"""
+        packed = pdfgen.inflating_content(b"", 3 * MIB)[:-6]
+
+        with adapter._bounded_streams(3 * MIB):
+            assert len(adapter._bounded_decompress_corrupted(packed)) == 3 * MIB
+        with adapter._bounded_streams(3 * MIB - 1), pytest.raises(LimitExceededError):
+            adapter._bounded_decompress_corrupted(packed)
+
 
 class TestAPredictor:
     """PNG's builds 9 bytes per column before it reads any data, so `Columns` is bounded too."""
@@ -254,6 +267,81 @@ def outcome_of(decode, data):
         return ("ValueError", str(error))
 
 
+def pdfminer_strip(data):
+    return pdfminer.ascii85.end_re.sub(b"", pdfminer.ascii85.start_re.sub(b"", data))
+
+
+class TestAscii85MarkerStrip:
+    """SEC-20, INV-1: the linear strip removes exactly what pdfminer's two regexes remove."""
+
+    # Every way whitespace, a marker half and a digit can meet, including the form feed and the
+    # vertical tab that `\s` counts as whitespace.
+    ALPHABET = b" \n\x0c\x0b<~>a"
+
+    def test_pins_the_regexes_it_stands_for(self):
+        """Risk 6: a pdfminer release that changes either pattern fails here, not in the text."""
+        assert pdfminer.ascii85.start_re.pattern == rb"^\s*<?\s*~\s*"
+        assert pdfminer.ascii85.end_re.pattern == rb"\s*~\s*>?\s*$"
+        assert pdfminer.ascii85.start_re.flags == pdfminer.ascii85.end_re.flags == 0
+
+    def test_matches_the_regexes_on_every_input_up_to_six_bytes_over_the_hostile_alphabet(self):
+        for length in range(7):
+            for symbols in itertools.product(self.ALPHABET, repeat=length):
+                data = bytes(symbols)
+                assert adapter._strip_ascii85_markers(data) == pdfminer_strip(data), data
+
+    def test_matches_the_regexes_on_random_input(self):
+        generator = random.Random(7)  # noqa: S311 - seeded, so a failure repeats
+        for index in range(20_000):
+            alphabet = bytes(range(256)) if index % 2 else self.ALPHABET
+            data = bytes(generator.choice(alphabet) for _ in range(generator.randrange(40)))
+            assert adapter._strip_ascii85_markers(data) == pdfminer_strip(data), data
+
+    @pytest.mark.parametrize("data", [b"", b"~", b"<~", b"<~~>", b" < ~ ~ > "])
+    def test_leaves_nothing_of_input_that_is_only_markers_and_whitespace(self, data):
+        assert adapter._strip_ascii85_markers(data) == pdfminer_strip(data) == b""
+
+    def test_scans_32_mib_of_whitespace_in_well_under_a_second(self):
+        """The regexes take minutes on this, in one C call. A child, so a regression can't hang."""
+        code = (
+            "import time\n"
+            "from pdftext import adapter\n"
+            "data = b' ' * (32 << 20) + b'!'\n"
+            "started = time.perf_counter()\n"
+            "stripped = adapter._strip_ascii85_markers(data)\n"
+            "print(time.perf_counter() - started, len(stripped))\n"
+        )
+
+        run = subprocess.run(  # noqa: S603 - fixed interpreter and source
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=30, check=True
+        )
+
+        seconds, stripped = run.stdout.split(maxsplit=1)
+        assert int(stripped) == (32 << 20) + 1  # no marker, so nothing is removed
+        assert float(seconds) < 1
+
+    def test_a_32_mib_whitespace_stream_decodes_to_nothing_in_under_a_second(self):
+        """SEC-20, through the filter `decode` calls, in a child for the same reason."""
+        code = (
+            "import time\n"
+            "from pdfminer import pdftypes\n"
+            "from pdftext import adapter\n"
+            "data = b' ' * (32 << 20) + b'!'\n"
+            "started = time.perf_counter()\n"
+            "with adapter._bounded_streams(32 << 20):\n"
+            "    decoded = pdftypes.ascii85decode(data)\n"
+            "print(time.perf_counter() - started, decoded)\n"
+        )
+
+        run = subprocess.run(  # noqa: S603 - fixed interpreter and source
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=30, check=True
+        )
+
+        seconds, decoded = run.stdout.split(maxsplit=1)
+        assert decoded.strip() == "b''"
+        assert float(seconds) < 1
+
+
 class TestAscii85InSlices:
     """It gives pdfminer's bytes, or its `ValueError`, whatever the input and wherever it is cut."""
 
@@ -281,6 +369,21 @@ class TestAscii85InSlices:
         generator = random.Random(4)  # noqa: S311 - seeded, so a failure repeats
         for _ in range(2000):
             data = bytes(generator.choice(digits) for _ in range(generator.randrange(60)))
+            with adapter._bounded_streams(MIB):
+                bounded = outcome_of(pdftypes.ascii85decode, data)
+            assert bounded == outcome_of(original, data), data
+
+    @pytest.mark.parametrize(
+        "prefix", [b"", b" ", b"<~", b" < ~ ", b"~", b"<", b"\x0c~", b"<~\n", b"< \x0b"]
+    )
+    @pytest.mark.parametrize("suffix", [b"", b"~>", b" ~ > ", b"~", b">", b"\n~>\n", b" ", b"\x0c"])
+    def test_matches_pdfminer_with_markers_and_whitespace_around_random_input(self, prefix, suffix):
+        original = adapter._PDFMINER_FILTERS["ascii85decode"]
+        digits = bytes(range(33, 118)) + b"z \t\n\r\x0b\x0c~<>y{"
+        generator = random.Random(8)  # noqa: S311 - seeded, so a failure repeats
+        for _ in range(100):
+            body = bytes(generator.choice(digits) for _ in range(generator.randrange(30)))
+            data = prefix + body + suffix
             with adapter._bounded_streams(MIB):
                 bounded = outcome_of(pdftypes.ascii85decode, data)
             assert bounded == outcome_of(original, data), data
@@ -327,7 +430,6 @@ THE_NINE_NAMES = {
     "apply_tiff_predictor",
 }
 ORIGINALS_BY_NAME = {
-    "zlib": zlib,
     "lzwdecode": pdfminer.lzw.lzwdecode,
     "rldecode": pdfminer.runlength.rldecode,
     "ascii85decode": pdfminer.ascii85.ascii85decode,
@@ -360,9 +462,17 @@ class TestTheSeam:
         replacement = next(each.bounded for each in adapter._DECODE_FILTERS if each.name == name)
         assert getattr(pdftypes, name) is replacement
 
-    @pytest.mark.parametrize("name", sorted(THE_NINE_NAMES - {"decompress_corrupted"}))
+    @pytest.mark.parametrize("name", sorted(THE_NINE_NAMES - {"zlib", "decompress_corrupted"}))
     def test_each_original_is_the_function_from_its_home_module(self, name):
+        """Read from `pdftypes`, so it is also the function `decode` called before the seam."""
         assert adapter._PDFMINER_FILTERS[name] is ORIGINALS_BY_NAME[name]
+
+    def test_the_zlib_shim_stands_in_for_the_standard_library_module(self):
+        shim = pdftypes.zlib
+
+        assert shim is next(each.bounded for each in adapter._DECODE_FILTERS if each.name == "zlib")
+        assert shim.decompressobj is zlib.decompressobj
+        assert shim.error is zlib.error
 
     def test_the_original_retry_for_corrupt_flate_is_pdfminers_own(self):
         original = adapter._PDFMINER_FILTERS["decompress_corrupted"]
@@ -390,8 +500,6 @@ class TestTheSeam:
 
     def test_each_replacement_takes_the_arguments_pdfminer_gives_its_original(self):
         for name, original in adapter._PDFMINER_FILTERS.items():
-            if name == "zlib":
-                continue
             replacement = getattr(pdftypes, name)
             assert list(inspect.signature(replacement).parameters) == list(
                 inspect.signature(original).parameters

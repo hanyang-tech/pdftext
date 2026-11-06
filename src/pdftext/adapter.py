@@ -17,12 +17,12 @@ from dataclasses import dataclass
 from io import BufferedReader, BytesIO
 from itertools import chain
 from pathlib import Path
-from types import ModuleType, SimpleNamespace, TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Any, NamedTuple, NoReturn, Self
 
 import pdfplumber
 import pypdfium2  # type: ignore[import-untyped]  # ships no type information
-from pdfminer import ascii85, ccitt, lzw, pdftypes, runlength, utils
+from pdfminer import lzw, pdftypes
 from pdfminer.pdfdocument import PDFDocument, PDFEncryptionError
 from pdfminer.pdfexceptions import PDFException, PDFObjectNotFound
 from pdfminer.pdfpage import LITERAL_PAGE, LITERAL_PAGES, PDFPage
@@ -179,17 +179,39 @@ def _decode_ascii85_slice(decoded: bytearray, digits: memoryview) -> None:
         decoded += base64.a85decode(digits[start : start + _ASCII85_SLICE])
 
 
+def _strip_ascii85_markers(data: bytes) -> bytes:
+    r"""pdfminer's `start_re` and `end_re` substitutions, in linear time.
+
+    Both regexes are quadratic on whitespace, in one C call that holds the GIL, so the watchdog
+    can't stop it: 80,000 spaces took 5 s. The first is `^\s*<?\s*~\s*` and removes nothing
+    unless a `~` follows the optional `<`. The second, `\s*~\s*>?\s*$`, removes the longest
+    suffix of that shape, and runs on what the first leaves. `\s` on bytes is `_PDF_WHITESPACE`.
+    """
+    head = data.lstrip(_PDF_WHITESPACE)
+    if head.startswith(b"<"):
+        head = head[1:].lstrip(_PDF_WHITESPACE)
+    if head.startswith(b"~"):
+        data = head[1:].lstrip(_PDF_WHITESPACE)
+    tail = data.rstrip(_PDF_WHITESPACE)
+    if tail.endswith(b">"):
+        tail = tail[:-1].rstrip(_PDF_WHITESPACE)
+    if tail.endswith(b"~"):
+        data = tail[:-1].rstrip(_PDF_WHITESPACE)
+    return data
+
+
 def _bounded_ascii85decode(data: bytes) -> bytes:
     """Same bytes, or the same `ValueError`, as pdfminer's, in slices of a few MiB at a time.
 
-    pdfminer strips `<~`, `~>` and whitespace and makes one `a85decode` call, whose working memory
-    is a list per group. Here the output is sized first, then each run of digits between `z`s is
-    decoded in slices of whole groups, so that list never outgrows one slice.
+    pdfminer strips `<~`, `~>` and whitespace (here, in linear time) and makes one `a85decode`
+    call, whose working memory is a list per group. Here the output is sized first, then each run
+    of digits between `z`s is decoded in slices of whole groups, so that list never outgrows one
+    slice.
     """
     max_bytes = _stream_limit.max_bytes
     if max_bytes is None:
         return _PDFMINER_FILTERS["ascii85decode"](data)
-    stripped = ascii85.end_re.sub(b"", ascii85.start_re.sub(b"", data))
+    stripped = _strip_ascii85_markers(data)
     digits = stripped.translate(None, _ASCII85_IGNORED)
     zeros = digits.count(b"z")
     others = len(digits) - zeros
@@ -239,7 +261,6 @@ def _bounded_ccittfaxdecode(data: bytes, params: dict[str, object]) -> bytes:
 
 class _DecodeFilter(NamedTuple):
     name: str  # the global `PDFStream.decode` looks up in `pdfminer.pdftypes`
-    home: ModuleType  # where pdfminer's version is found before it is replaced
     bounded: Any
 
 
@@ -247,24 +268,25 @@ _DECODE_FILTERS = (
     # The zlib C call can't be interrupted, so it is bounded from the inside.
     _DecodeFilter(
         "zlib",
-        pdftypes,
         SimpleNamespace(
             decompress=_bounded_decompress, decompressobj=zlib.decompressobj, error=zlib.error
         ),
     ),
-    _DecodeFilter("decompress_corrupted", pdftypes, _bounded_decompress_corrupted),
-    _DecodeFilter("lzwdecode", lzw, _bounded_lzwdecode),
-    _DecodeFilter("rldecode", runlength, _bounded_rldecode),
-    _DecodeFilter("asciihexdecode", ascii85, _bounded_asciihexdecode),
-    _DecodeFilter("ascii85decode", ascii85, _bounded_ascii85decode),
-    _DecodeFilter("ccittfaxdecode", ccitt, _bounded_ccittfaxdecode),
-    _DecodeFilter("apply_png_predictor", utils, _bounded_apply_png_predictor),
-    _DecodeFilter("apply_tiff_predictor", utils, _bounded_apply_tiff_predictor),
+    _DecodeFilter("decompress_corrupted", _bounded_decompress_corrupted),
+    _DecodeFilter("lzwdecode", _bounded_lzwdecode),
+    _DecodeFilter("rldecode", _bounded_rldecode),
+    _DecodeFilter("asciihexdecode", _bounded_asciihexdecode),
+    _DecodeFilter("ascii85decode", _bounded_ascii85decode),
+    _DecodeFilter("ccittfaxdecode", _bounded_ccittfaxdecode),
+    _DecodeFilter("apply_png_predictor", _bounded_apply_png_predictor),
+    _DecodeFilter("apply_tiff_predictor", _bounded_apply_tiff_predictor),
 )
-# What each name was before it was replaced. `zlib` is the module, and is called as `zlib` here.
+# What each function was in `pdftypes`, where `decode` finds it, before it was replaced. A name
+# pdfminer no longer has there fails here, at import. `zlib` is the stdlib module, imported above.
 _PDFMINER_FILTERS: dict[str, Callable[..., bytes]] = {
-    decode_filter.name: getattr(decode_filter.home, decode_filter.name)
+    decode_filter.name: getattr(pdftypes, decode_filter.name)
     for decode_filter in _DECODE_FILTERS
+    if decode_filter.name != "zlib"
 }
 for _decode_filter in _DECODE_FILTERS:
     setattr(pdftypes, _decode_filter.name, _decode_filter.bounded)
