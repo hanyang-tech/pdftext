@@ -1,15 +1,126 @@
 # pdftext
 
 Turn digital PDFs into layout-aware XML: text with its position on the page, one file per page.
+Columns, reading order, ruled and borderless tables, and tables nested inside table cells are
+kept as structure, and every element carries its bounding box.
+
+## Install
+
+pdftext needs Python 3.13 or later and [uv](https://docs.astral.sh/uv/).
+
+```
+git clone git@github.com:hanyang-tech/pdftext.git
+cd pdftext
+uv sync
+```
+
+To install the `pdftext` command outside the project instead: `uv tool install .` (or
+`pip install .` into a virtual environment).
+
+## Run the parser
+
+One PDF:
 
 ```
 uv run pdftext input.pdf -o out/
 ```
 
-This writes `out/page-0001.xml` for each page and `out/document.xml` listing them. The schema
-is `src/pdftext/schema/pdftext.xsd`.
+This writes `out/page-0001.xml`, `out/page-0002.xml`, … for each page and `out/document.xml`
+listing them. Try it on a fixture with nested tables:
 
-From Python:
+```
+uv run pdftext tests/fixtures/nested.pdf -o out/nested/
+```
+
+One PDF or a whole folder, with a summary line per file:
+
+```
+scripts/convert.sh input.pdf            # writes out/input/
+scripts/convert.sh pdfs/                # writes out/<name>/ for each PDF in pdfs/
+scripts/convert.sh pdfs/ results/ --page-timeout 10
+```
+
+Options after the output folder go to `pdftext` unchanged. The script exits with the worst exit
+code it saw.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Every page converted |
+| 3 | Some pages failed: each has `status="error"` and a message, all other pages are written |
+| 2 | Refused: not a PDF, damaged beyond repair, password-protected, or over a limit. One line on stderr, no `document.xml` |
+| 1 | The output can't be written, or an internal error |
+
+### Limits
+
+Untrusted PDFs can't hang the parser or exhaust memory. Each limit has a default and an option:
+
+| Option | Default | When it is exceeded |
+|---|---|---|
+| `--max-file-bytes` | 1 GiB | refused, exit 2 |
+| `--max-pages` | 10,000 | refused, exit 2 |
+| `--total-timeout` | 1800 s | run stops, exit 2 |
+| `--max-memory-bytes` | 2 GiB | run stops, exit 2 |
+| `--page-timeout` | 30 s | that page is an error page, exit 3 |
+| `--max-stream-bytes` | 256 MiB | that page is an error page, exit 3 |
+| `--max-chars-per-page` | 200,000 | that page is an error page, exit 3 |
+| `--max-table-depth` | 16 | a deeper table is dropped and its text kept in the enclosing cell |
+
+`uv run pdftext --help` lists them all.
+
+## Output
+
+`document.xml`:
+
+```xml
+<document schema-version="1" pages="2">
+  <page number="1" href="page-0001.xml" status="ok" bbox="0.00 0.00 612.00 792.00" />
+  <page number="2" href="page-0002.xml" status="ok" bbox="0.00 0.00 792.00 612.00" />
+</document>
+```
+
+`page-0001.xml` (shortened, indented here for reading; the files have no whitespace between
+elements):
+
+```xml
+<page schema-version="1" number="1" bbox="0.00 0.00 612.00 792.00" status="ok">
+  <region bbox="50.00 44.07 128.37 78.07">
+    <line bbox="50.00 44.07 128.37 54.07">
+      <word bbox="50.00 44.07 66.68 54.07">Left</word>
+      <word bbox="69.46 44.07 101.69 54.07">column</word>
+    </line>
+  </region>
+  <table bbox="50.00 112.00 560.00 292.00" rows="2" cols="2" detection="ruled">
+    <row bbox="50.00 112.00 560.00 172.00" index="0">
+      <cell bbox="50.00 112.00 250.00 172.00" col="0">
+        <region bbox="60.00 134.07 100.02 144.07">
+          <line bbox="60.00 134.07 100.02 144.07">
+            <word bbox="60.00 134.07 85.01 144.07">Outer</word>
+            <word bbox="87.79 134.07 100.02 144.07">A1</word>
+          </line>
+        </region>
+      </cell>
+      …
+    </row>
+  </table>
+</page>
+```
+
+- **Bounding boxes** are `x0 top x1 bottom` in PDF points (1/72 inch), with the origin at the
+  page's top-left corner and y growing downwards. The page's own `bbox` is `0 0 width height`.
+- **Elements:** a page holds `region`, `table` and `figure` elements in reading order. A region
+  holds `line`s, a line holds `word`s, and text appears only in `word`. A table holds `row`s, a
+  row holds `cell`s, and a cell holds regions, figures and further `table`s, to any depth up to
+  `--max-table-depth`.
+- **Tables:** `detection="ruled"` for tables drawn with lines, `"text"` for borderless tables
+  found from text alignment. Cells carry `colspan` and `rowspan` when merged.
+- **Page status:** `ok`, `no-text` (a scanned or image-only page; pdftext does no OCR) or
+  `error` with a `message` attribute.
+
+The full schema is [`src/pdftext/schema/pdftext.xsd`](src/pdftext/schema/pdftext.xsd).
+
+## From Python
 
 ```python
 from pdftext import convert, iter_pages
