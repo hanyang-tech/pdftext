@@ -153,6 +153,33 @@ class TestGroupLines:
 
         assert word_texts(chars) == words
 
+    def test_small_label_just_before_a_larger_value_is_two_words(self):
+        # ACORD 125: a 6 pt "ZIP:" ends 1.07 pt before the 8 pt value, under a fifth of either size.
+        label = make_chars("ZIP:", 201.6, size=6.0, advance=2.83)
+        value = make_chars("49077", 201.6 + 4 * 2.83 + 1.07, size=8.0, advance=4.45, first_seq=4)
+
+        assert word_texts(label + value) == [["ZIP:", "49077"]]
+
+    @pytest.mark.parametrize(("gap", "words"), [(0.55, [["abcd"]]), (0.65, [["ab", "cd"]])])
+    def test_at_a_size_change_a_gap_wider_than_a_tenth_of_the_smaller_size_starts_a_word(
+        self, gap, words
+    ):
+        chars = make_chars("ab", size=6.0) + make_chars("cd", 10 + gap, size=8.0, first_seq=2)
+
+        assert word_texts(chars) == words
+
+    def test_small_caps_set_with_no_gap_stay_one_word(self):
+        capital = make_chars("A", size=10.0)
+        small = make_chars("CORD", 5, size=8.0, advance=4.0, first_seq=1)
+
+        assert word_texts(capital + small) == [["ACORD"]]
+
+    def test_sizes_within_a_tenth_of_each_other_keep_the_plain_word_gap(self):
+        # 1.5 is past a tenth of 9.5 but within a fifth of 10, and 9.5 isn't a size change.
+        chars = make_chars("ab", size=10.0) + make_chars("cd", 11.5, size=9.5, first_seq=2)
+
+        assert word_texts(chars) == [["abcd"]]
+
     @pytest.mark.parametrize(("gap", "lines"), [(19.5, [["ab", "cd"]]), (20.5, [["ab"], ["cd"]])])
     def test_gap_wider_than_twice_the_size_starts_a_line(self, gap, lines):
         chars = make_chars("ab") + make_chars("cd", 10 + gap, first_seq=2)

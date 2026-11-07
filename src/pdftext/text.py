@@ -13,6 +13,12 @@ BASELINE_TOLERANCE = 0.3
 # A gap wider than this many sizes starts a new word, and wider than LINE_GAP a new line.
 WORD_GAP = 0.2
 LINE_GAP = 2.0
+# Where the size changes, a gap wider than this many of the smaller size also starts a word.
+# A small label printed just before a larger value is then two words, while small caps and
+# superscripts, set with no gap, stay one.
+SIZE_CHANGE_GAP = 0.1
+# Two sizes further apart than this fraction of the larger one are a size change.
+SIZE_CHANGE = 0.1
 
 REPLACEMENT_CHAR = "�"
 # Code points XML 1.0 forbids: C0 controls except tab, newline and carriage return,
@@ -74,7 +80,7 @@ def _split_words(cluster: tuple[RawChar, ...]) -> list[tuple[RawChar, ...]]:
         if char.text.isspace():
             word_ended = True
             continue
-        if previous is not None and char.u0 - previous.u1 > WORD_GAP * previous.size:
+        if previous is not None and _gap_starts_word(previous, char):
             word_ended = True
         if word_ended:
             words.append([])
@@ -82,6 +88,14 @@ def _split_words(cluster: tuple[RawChar, ...]) -> list[tuple[RawChar, ...]]:
         word_ended = False
         previous = char
     return [tuple(word) for word in words]
+
+
+def _gap_starts_word(previous: RawChar, char: RawChar) -> bool:
+    gap = char.u0 - previous.u1
+    if gap > WORD_GAP * previous.size:
+        return True
+    smaller, larger = sorted((previous.size, char.size))
+    return larger - smaller > SIZE_CHANGE * larger and gap > SIZE_CHANGE_GAP * smaller
 
 
 def _split_lines(words: list[tuple[RawChar, ...]]) -> list[list[tuple[RawChar, ...]]]:
