@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdftext viewer</title>
+<style>
+  :root { --toolbar-bg: #20242b; --toolbar-fg: #e8eaed; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; font: 13px/1.4 system-ui, sans-serif; background: #8a8d91; }
+
+  /* Toolbar: wraps in narrow windows; it never scrolls because only #viewport does. */
+  #toolbar { flex: none; z-index: 100; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px;
+    padding: 6px 10px; background: var(--toolbar-bg); color: var(--toolbar-fg); }
+  #toolbar .group { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
+  #toolbar button, #toolbar select, #toolbar input[type=text], #toolbar input[type=number] {
+    font: inherit; padding: 2px 6px; border: 1px solid #555b66; border-radius: 4px; background: #2d323b; color: inherit; }
+  #toolbar button { cursor: pointer; }
+  #toolbar button:hover { background: #3a414d; }
+  #toolbar input[type=number] { width: 4.5em; }
+  #toolbar #search { width: 12em; max-width: 100%; }
+  #toolbar label { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; cursor: pointer; }
+  #docLabel { opacity: .7; max-width: 22em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border: 2px solid var(--c); border-radius: 2px; vertical-align: -1px; }
+  #legend { display: inline-flex; gap: 6px; align-items: center; opacity: .9; }
+
+  #message { flex: none; margin: 0; padding: 8px 12px; white-space: pre-wrap; background: #dbeafe; color: #1e3a8a; }
+  #message.error { background: #fee2e2; color: #991b1b; }
+  #message.warn { background: #fef3c7; color: #92400e; }
+  #message[hidden] { display: none; }
+
+  #viewport { flex: 1; min-height: 0; overflow: auto; position: relative; }
+  #viewport.dragging::after { content: "Drop the output folder or its XML files"; position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center; font-size: 20px; color: #fff;
+    background: rgba(20, 60, 140, .55); border: 4px dashed #fff; pointer-events: none; }
+  #pages { --zoom: 1; display: flex; flex-direction: column; align-items: center; gap: 18px;
+    width: max-content; min-width: 100%; padding: 16px; }
+  #hint { color: #fff; padding: 40px; text-align: center; }
+
+  .page { flex: none; }
+  .page-label { display: flex; gap: 8px; align-items: baseline; margin-bottom: 3px; color: #fff; font-weight: 600; }
+  .page-label .tag { font-weight: 400; font-size: 11px; padding: 0 5px; border-radius: 8px; background: #fff3; }
+  .page-label .tag.error { background: #b91c1c; }
+  .sheet { position: relative; background: #fff; box-shadow: 0 1px 6px #0006; overflow: hidden;
+    width: calc(var(--pw) * var(--zoom) * 1px); height: calc(var(--ph) * var(--zoom) * 1px); }
+  .content { position: absolute; left: 0; top: 0; width: calc(var(--pw) * 1px); height: calc(var(--ph) * 1px);
+    transform: scale(var(--zoom)); transform-origin: 0 0; color: #111; }
+  .sheet-note { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    padding: 12px; text-align: center; color: #777; font-size: 14px; pointer-events: none; }
+  .sheet-note.error { align-items: flex-start; justify-content: flex-start; text-align: left; color: #c00; font-weight: 600; }
+
+  /* Boxes are flat siblings in XML order, positioned in page points. */
+  .box { position: absolute; }
+  /* A region or line can come later in XML order than a word it overlaps; keep text on top for hover and click. */
+  .region { z-index: 2; } .line { z-index: 3; } .word { z-index: 4; } .badge, .order-badge { z-index: 5; }
+  .word { white-space: pre; font-family: Helvetica, Arial, "Liberation Sans", "Nimbus Sans", sans-serif; transform-origin: 50% 50%; }
+  .row { pointer-events: auto; }
+  .badge { position: absolute; font: 600 7px/1 sans-serif; padding: 1px 3px; color: #fff; background: #d97706;
+    border-radius: 2px; pointer-events: none; transform: translateX(-100%); }
+  .page-label .tag.overflow, .cell-badge { background: #d97706; color: #fff; }
+  .order-badge { position: absolute; display: none; min-width: 12px; padding: 1px 3px; font: 700 9px/1.2 sans-serif;
+    text-align: center; color: #fff; background: #dc2626; border-radius: 6px; pointer-events: none; }
+  #pages.show-order .order-badge { display: block; }
+  .figure { background: repeating-linear-gradient(45deg, rgba(0,0,0,.07) 0 3px, transparent 3px 6px); outline: 1px solid #bbb; outline-offset: -1px; }
+  .figure::after { content: "figure"; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    font: 10px sans-serif; color: #666; background: #fffc; padding: 0 3px; }
+
+  /* Overlays: constant 1px lines on screen regardless of zoom. */
+  #pages { --line: calc(1px / var(--zoom)); }
+  .d0 { --c: #1f6feb; } .d1 { --c: #2da44e; } .d2 { --c: #d97706; } .d3 { --c: #a855f7; }
+  #legend .swatch { border-color: var(--c); }
+  .table, .cell { outline: 0 solid var(--c); }
+  #pages.show-tables .table { outline-width: calc(var(--line) * 2); outline-offset: calc(var(--line) * -1); }
+  #pages.show-cells .cell { outline-width: var(--line); outline-offset: calc(var(--line) * -.5); }
+  .table.text, .cell.text { outline-style: dashed; }
+  .table.ruled, .cell.ruled { outline-style: solid; }
+  #pages.show-regions .region { outline: var(--line) solid #0891b2; }
+  #pages.show-lines .line { outline: var(--line) solid #db2777; }
+  #pages.show-words .word { outline: var(--line) solid #65a30d; }
+  #pages.show-figures .figure { outline: calc(var(--line) * 2) solid #e11d48; }
+  .word.match { background: #fde047; }
+  .word.current { background: #fb923c; }
+  .box.hl { outline: calc(var(--line) * 3) solid #e11d48 !important; outline-offset: calc(var(--line) * -1) !important; z-index: 1; }
+
+  #tooltip { position: fixed; z-index: 200; max-width: 480px; padding: 5px 8px; border-radius: 4px; pointer-events: none;
+    background: #111e; color: #fff; font: 12px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #tooltip[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <div class="group">
+    <button id="openButton" type="button">Open folder</button>
+    <input id="folderInput" type="file" webkitdirectory multiple hidden>
+    <span id="docLabel"></span>
+  </div>
+  <div class="group">
+    <button id="zoomOut" type="button" title="Zoom out" aria-label="Zoom out">&minus;</button>
+    <select id="zoomSelect" aria-label="Zoom"></select>
+    <button id="zoomIn" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+    <span>Page <input id="pageInput" type="number" min="1" value="1" aria-label="Page number"> <span id="pageCount">/ 0</span></span>
+  </div>
+  <div class="group" id="toggles" aria-label="Overlays"></div>
+  <div class="group"><span id="legend" title="Table nesting depth"></span></div>
+  <div class="group">
+    <input id="search" type="text" placeholder="Search words" aria-label="Search words" autocomplete="off">
+    <button id="searchPrev" type="button" title="Previous match (Shift+Enter)" aria-label="Previous match">&uarr;</button>
+    <button id="searchNext" type="button" title="Next match (Enter)" aria-label="Next match">&darr;</button>
+    <span id="searchCount"></span>
+  </div>
+</div>
+<p id="message" role="alert" hidden></p>
+<div id="viewport"><div id="pages"><div id="hint">Open a pdftext output folder (the one containing document.xml), or drop it here.</div></div></div>
+<div id="tooltip" hidden></div>
+
+<script>
+"use strict";
+
+const PAGE_HREF = /^page-\d{4,}\.xml$/;
+const DESCENT = 0.207;                       // glyph box bottom = baseline + DESCENT * size
+const FONT_STACK = 'Helvetica, Arial, "Liberation Sans", "Nimbus Sans", sans-serif';
+const ZOOM_LEVELS = [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3];
+const OVERLAYS = [
+  ["regions", "Regions", false], ["lines", "Lines", false], ["words", "Words", false],
+  ["tables", "Tables", true], ["cells", "Cells", true], ["figures", "Figures", false],
+  ["order", "Reading order", false],
+];
+const BLOCK_KINDS = new Set(["region", "table", "figure"]);
+
+const $ = (id) => document.getElementById(id);
+const viewport = $("viewport");
+const pagesEl = $("pages");
+
+const state = {
+  pages: [],
+  zoomMode: "fit",          // "fit" or a number
+  observer: null,
+  search: { query: "", matches: [], cursor: -1 },
+};
+const boxInfo = new WeakMap();   // box element -> { kind, element, path, parent }
+
+/* ---------- Parsing helpers ---------- */
+
+function parseBBox(text, context) {
+  const parts = (text || "").trim().split(/\s+/).map(Number);
+  if (parts.length !== 4 || !parts.every(Number.isFinite)) {
+    throw new Error(`${context}: invalid bbox "${text}"`);
+  }
+  const [x0, top, x1, bottom] = parts;
+  return { x0, top, x1, bottom, width: Math.max(0, x1 - x0), height: Math.max(0, bottom - top) };
+}
+
+function parseXml(text, fileName) {
+  const doc = new DOMParser().parseFromString(text, "application/xml");
+  const problem = doc.getElementsByTagName("parsererror")[0];
+  if (problem) {
+    throw new Error(`${fileName}: not well-formed XML.\n${problem.textContent.trim().slice(0, 400)}`);
+  }
+  return doc;
+}
+
+function expectRoot(doc, expected, fileName) {
+  const actual = doc.documentElement.localName;
+  if (actual !== expected) {
+    throw new Error(`${fileName}: unexpected root element <${actual}>, expected <${expected}>`);
+  }
+  return doc.documentElement;
+}
+
+function childElements(element, localName) {
+  return Array.from(element.children).filter((child) => child.localName === localName);
+}
+
+/* ---------- Text metrics ---------- */
+
+const measureContext = document.createElement("canvas").getContext("2d");
+measureContext.font = `100px ${FONT_STACK}`;
+
+function naturalTextWidth(text, fontSize) {
+  return (measureContext.measureText(text).width / 100) * fontSize;
+}
+
+// Baseline position, as a fraction of font size from the top of a line box whose line-height equals the font size.
+const BASELINE_RATIO = (() => {
+  const { fontBoundingBoxAscent: ascent, fontBoundingBoxDescent: descent } = measureContext.measureText("Hg");
+  if (!ascent) return 0.8465;   // Arial metrics when the browser lacks fontBoundingBox support
+  return ((100 - (ascent + descent)) / 2 + ascent) / 100;
+})();
+
+/* ---------- Loading ---------- */
+
+function showMessage(text, level) {
+  const el = $("message");
+  el.textContent = text;
+  el.className = level || "";
+  el.hidden = !text;
+}
+
+function directoryName(path) {
+  return path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+}
+
+async function loadDocument(readText, label) {
+  resetViewer();
+  $("docLabel").textContent = label;
+  showMessage("Loading…");
+  try {
+    const documentRoot = expectRoot(parseXml(await readText("document.xml"), "document.xml"), "document", "document.xml");
+    const entries = childElements(documentRoot, "page");
+    if (entries.length === 0) throw new Error("document.xml: no <page> entries");
+    const pageFiles = await Promise.all(entries.map((entry) => readPageFile(entry, readText)));
+    const declared = Number(documentRoot.getAttribute("pages"));
+    buildViewer(pageFiles);
+    const mismatch = declared !== entries.length ? `document.xml declares pages="${declared}" but lists ${entries.length}.` : "";
+    showMessage(mismatch, mismatch ? "warn" : "");
+  } catch (error) {
+    resetViewer();
+    showMessage(error.message, "error");
+  }
+}
+
+async function readPageFile(entry, readText) {
+  const href = entry.getAttribute("href") || "";
+  if (!PAGE_HREF.test(href)) throw new Error(`document.xml: invalid page href "${href}" (expected page-NNNN.xml)`);
+  const root = expectRoot(parseXml(await readText(href), href), "page", href);
+  return { href, root, entry };
+}
+
+function serverReader(docBase) {
+  return async (name) => {
+    let response;
+    try {
+      response = await fetch(new URL(name, docBase));
+    } catch (error) {
+      throw new Error(`Cannot fetch ${name} from ${docBase}. If this page was opened from disk, use "Open folder".`);
+    }
+    if (!response.ok) throw new Error(`Cannot load ${name} (HTTP ${response.status}) from ${docBase}`);
+    return response.text();
+  };
+}
+
+function fileReader(filesByName) {
+  return async (name) => {
+    const file = filesByName.get(name);
+    if (!file) throw new Error(`Missing file ${name} among the selected files`);
+    return file.text();
+  };
+}
+
+// candidates: [{ file, path }]. Uses the shallowest folder holding a document.xml.
+function openFileCandidates(candidates) {
+  const documents = candidates.filter((c) => c.file.name === "document.xml")
+    .sort((a, b) => a.path.split("/").length - b.path.split("/").length || a.path.localeCompare(b.path));
+  if (documents.length === 0) {
+    showMessage("No document.xml found in the selected files.", "error");
+    return;
+  }
+  const folder = directoryName(documents[0].path);
+  const inFolder = candidates.filter((c) => directoryName(c.path) === folder);
+  loadDocument(fileReader(new Map(inFolder.map((c) => [c.file.name, c.file]))), folder || "(selected files)");
+}
+
+const WANTED_FILE = /^(document|page-\d{4,})\.xml$/;
+
+async function entryCandidates(entry, parentPath, depth) {
+  const path = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+  if (entry.isFile) {
+    if (!WANTED_FILE.test(entry.name)) return [];
+    const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+    return [{ file, path }];
+  }
+  if (depth > 4) return [];
+  const reader = entry.createReader();
+  const found = [];
+  for (;;) {
+    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+    if (batch.length === 0) return found;
+    for (const child of batch) found.push(...await entryCandidates(child, path, depth + 1));
+  }
+}
+
+async function handleDrop(event) {
+  event.preventDefault();
+  viewport.classList.remove("dragging");
+  // Entries must be read synchronously; the DataTransfer is cleared after the event.
+  const entries = Array.from(event.dataTransfer.items || []).map((item) => item.webkitGetAsEntry && item.webkitGetAsEntry()).filter(Boolean);
+  try {
+    const nested = entries.length
+      ? await Promise.all(entries.map((entry) => entryCandidates(entry, "", 0)))
+      : [Array.from(event.dataTransfer.files).map((file) => ({ file, path: file.name }))];
+    openFileCandidates(nested.flat());
+  } catch (error) {
+    showMessage(`Could not read the dropped items: ${error.message}`, "error");
+  }
+}
+
+function handleFolderPicked(event) {
+  const candidates = Array.from(event.target.files)
+    .filter((file) => WANTED_FILE.test(file.name))
+    .map((file) => ({ file, path: file.webkitRelativePath || file.name }));
+  event.target.value = "";
+  openFileCandidates(candidates);
+}
+
+function startFromQuery() {
+  const doc = new URLSearchParams(location.search).get("doc");
+  if (doc === null) return;
+  const base = new URL(doc.endsWith("/") ? doc : `${doc}/`, location.href);
+  loadDocument(serverReader(base), base.pathname);
+}
+
+/* ---------- Page model ---------- */
+
+function resetViewer() {
+  if (state.observer) state.observer.disconnect();
+  state.observer = null;
+  state.pages = [];
+  state.search = { query: state.search.query, matches: [], cursor: -1 };
+  pagesEl.replaceChildren();
+  $("pageCount").textContent = "/ 0";
+  $("searchCount").textContent = "";
+}
+
+function buildPage({ href, root, entry }, position) {
+  const bbox = parseBBox(root.getAttribute("bbox"), href);
+  const words = Array.from(root.getElementsByTagName("word"));
+  return {
+    position,
+    number: root.getAttribute("number") || entry.getAttribute("number") || String(position + 1),
+    status: root.getAttribute("status") || "ok",
+    message: root.getAttribute("message") || "",
+    overflow: root.getAttribute("overflow") === "true",
+    replacedChars: root.getAttribute("replaced-chars"),
+    bbox, root, href,
+    wordIndex: new Map(words.map((word, index) => [word, index])),
+    wordTexts: words.map((word) => word.textContent.toLowerCase()),
+    wordBoxes: [],
+    wrapper: null, sheet: null, content: null, rendered: false,
+  };
+}
+
+function buildViewer(pageFiles) {
+  state.pages = pageFiles.map(buildPage);
+  pagesEl.replaceChildren(...state.pages.map(createPageShell));
+  state.observer = new IntersectionObserver(onPagesIntersect, { root: viewport, rootMargin: "1500px 0px" });
+  state.pages.forEach((page) => state.observer.observe(page.sheet));
+  $("pageInput").max = String(state.pages.length);
+  $("pageCount").textContent = `/ ${state.pages.length}`;
+  applyZoom();
+  runSearch();
+}
+
+function tag(text, className) {
+  const span = document.createElement("span");
+  span.className = `tag ${className || ""}`;
+  span.textContent = text;
+  return span;
+}
+
+function createPageShell(page) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "page";
+  const label = document.createElement("div");
+  label.className = "page-label";
+  const title = document.createElement("span");
+  title.textContent = `Page ${page.number}`;
+  label.append(title);
+  if (page.status !== "ok") label.append(tag(page.status, page.status === "error" ? "error" : ""));
+  if (page.overflow) label.append(tag("overflow", "overflow"));
+  if (page.replacedChars) label.append(tag(`${page.replacedChars} replaced chars`));
+
+  const sheet = document.createElement("div");
+  sheet.className = "sheet";
+  const content = document.createElement("div");
+  content.className = "content";
+  sheet.append(content);
+
+  wrapper.append(label, sheet);
+  Object.assign(page, { wrapper, sheet, content });
+  wrapper.style.setProperty("--pw", page.bbox.width);
+  wrapper.style.setProperty("--ph", page.bbox.height);
+  return wrapper;
+}
+
+function onPagesIntersect(entries) {
+  for (const entry of entries) {
+    if (!entry.isIntersecting) continue;
+    const page = state.pages.find((candidate) => candidate.sheet === entry.target);
+    if (page) renderPage(page);
+  }
+}
+
+/* ---------- Rendering ---------- */
+
+function renderPage(page) {
+  if (page.rendered) return;
+  page.rendered = true;
+  try {
+    const context = { page, wordBoxes: page.wordBoxes };
+    renderBlocks(context, page.root, `page ${page.number}`, null, 0);
+    addSheetNote(page);
+  } catch (error) {
+    addSheetNote(page, `Could not render this page: ${error.message}`);
+  }
+  applyPageHighlights(page);
+}
+
+function addSheetNote(page, forcedError) {
+  let text = forcedError || "";
+  let level = forcedError ? "error" : "";
+  if (!text && page.status === "error") { text = page.message || "Error"; level = "error"; }
+  if (!text && page.status === "no-text") text = page.message ? `No text on this page\n${page.message}` : "No text on this page";
+  if (!text) return;
+  const note = document.createElement("div");
+  note.className = `sheet-note ${level}`;
+  note.style.whiteSpace = "pre-wrap";
+  note.textContent = text;
+  page.sheet.append(note);
+}
+
+function renderBlocks(context, parentElement, parentPath, parentBox, depth) {
+  const isPageLevel = parentElement === context.page.root;
+  const counts = {};
+  let orderNumber = 0;
+  for (const child of Array.from(parentElement.children)) {
+    const kind = child.localName;
+    if (!BLOCK_KINDS.has(kind)) continue;
+    counts[kind] = (counts[kind] ?? -1) + 1;
+    const path = `${parentPath} › ${kind} ${counts[kind]}`;
+    if (kind === "region") renderRegion(context, child, path, parentBox);
+    else if (kind === "table") renderTable(context, child, path, parentBox, depth);
+    else addBox(context, "figure", child, path, parentBox);
+    if (isPageLevel) addOrderBadge(context, child, ++orderNumber);
+  }
+}
+
+function addBox(context, kind, element, path, parent, extraClasses = []) {
+  const bbox = parseBBox(element.getAttribute("bbox"), path);
+  const box = document.createElement("div");
+  box.className = ["box", kind, ...extraClasses].join(" ");
+  box.style.left = `${bbox.x0}px`;
+  box.style.top = `${bbox.top}px`;
+  box.style.width = `${bbox.width}px`;
+  box.style.height = `${bbox.height}px`;
+  boxInfo.set(box, { kind, element, path, parent });
+  context.page.content.append(box);
+  return box;
+}
+
+function addOrderBadge(context, element, number) {
+  const bbox = parseBBox(element.getAttribute("bbox"), "reading order");
+  const badge = document.createElement("div");
+  badge.className = "order-badge";
+  badge.textContent = String(number);
+  badge.style.left = `${bbox.x0}px`;
+  badge.style.top = `${bbox.top}px`;
+  context.page.content.append(badge);
+}
+
+function renderRegion(context, region, path, parent) {
+  const regionBox = addBox(context, "region", region, path, parent);
+  childElements(region, "line").forEach((line, index) => {
+    const lineBox = addBox(context, "line", line, `${path} › line ${index}`, regionBox);
+    for (const word of childElements(line, "word")) renderWord(context, word, `${path} › line ${index} › word`, lineBox);
+  });
+}
+
+function renderWord(context, wordElement, path, lineBox) {
+  const box = addBox(context, "word", wordElement, path, lineBox);
+  const bbox = parseBBox(wordElement.getAttribute("bbox"), path);
+  placeWordText(box, wordElement.textContent, bbox, Number(wordElement.getAttribute("rotation")) || 0);
+  box.textContent = wordElement.textContent;
+  const index = context.page.wordIndex.get(wordElement);
+  context.wordBoxes[index] = box;
+}
+
+// The text is laid out unrotated at font-size = glyph box thickness, scaled to span the box, then rotated about its centre.
+function placeWordText(box, text, bbox, rotation) {
+  const turnedSideways = rotation % 180 === 90;   // box is the displayed one, so its axes swap
+  const length = turnedSideways ? bbox.height : bbox.width;
+  const fontSize = turnedSideways ? bbox.width : bbox.height;
+  const naturalWidth = naturalTextWidth(text, fontSize);
+  const scaleX = naturalWidth > 0 ? length / naturalWidth : 1;
+  const baselineShift = (1 - DESCENT - BASELINE_RATIO) * fontSize;
+  const centerX = (bbox.x0 + bbox.x1) / 2;
+  const centerY = (bbox.top + bbox.bottom) / 2;
+  const style = box.style;
+  style.left = `${centerX - naturalWidth / 2}px`;
+  style.top = `${centerY - fontSize / 2}px`;
+  style.width = `${naturalWidth}px`;
+  style.height = `${fontSize}px`;
+  style.fontSize = `${fontSize}px`;
+  style.lineHeight = `${fontSize}px`;
+  style.transform = `rotate(${rotation}deg) translateY(${baselineShift}px) scaleX(${scaleX})`;
+}
+
+function renderTable(context, table, path, parent, depth) {
+  const detection = table.getAttribute("detection") === "text" ? "text" : "ruled";
+  const classes = [`d${Math.min(depth, 3)}`, detection];
+  const tableBox = addBox(context, "table", table, path, parent, classes);
+  for (const row of childElements(table, "row")) {
+    const rowPath = `${path} › r${row.getAttribute("index")}`;
+    const rowBox = addBox(context, "row", row, rowPath, tableBox);
+    for (const cell of childElements(row, "cell")) renderCell(context, cell, rowPath, rowBox, classes, depth);
+  }
+}
+
+function renderCell(context, cell, rowPath, rowBox, classes, depth) {
+  const path = `${rowPath} c${cell.getAttribute("col")}`;
+  const cellBox = addBox(context, "cell", cell, path, rowBox, classes);
+  if (cell.getAttribute("overflow") === "true") addCellBadge(context, cell, path);
+  renderBlocks(context, cell, path, cellBox, depth + 1);
+}
+
+function addCellBadge(context, cell, path) {
+  const bbox = parseBBox(cell.getAttribute("bbox"), path);
+  const badge = document.createElement("div");
+  badge.className = "badge";
+  badge.textContent = "overflow";
+  badge.style.left = `${bbox.x1}px`;
+  badge.style.top = `${bbox.top}px`;
+  context.page.content.append(badge);
+}
+
+/* ---------- Zoom and navigation ---------- */
+
+function fitZoom() {
+  const widest = Math.max(1, ...state.pages.map((page) => page.bbox.width));
+  const available = viewport.clientWidth - 32 - (viewport.offsetWidth - viewport.clientWidth);
+  return Math.min(5, Math.max(0.1, available / widest));
+}
+
+function effectiveZoom() {
+  return state.zoomMode === "fit" ? fitZoom() : state.zoomMode;
+}
+
+function applyZoom() {
+  const ratio = viewport.scrollHeight ? viewport.scrollTop / viewport.scrollHeight : 0;
+  pagesEl.style.setProperty("--zoom", effectiveZoom());
+  viewport.scrollTop = ratio * viewport.scrollHeight;
+  $("zoomSelect").value = String(state.zoomMode);
+  updateCurrentPage();
+}
+
+function setZoomMode(mode) {
+  state.zoomMode = mode;
+  applyZoom();
+}
+
+function stepZoom(direction) {
+  const current = effectiveZoom();
+  const candidates = direction > 0 ? ZOOM_LEVELS.filter((z) => z > current + 0.001) : ZOOM_LEVELS.filter((z) => z < current - 0.001).reverse();
+  if (candidates.length) setZoomMode(candidates[0]);
+}
+
+function currentPageIndex() {
+  const top = viewport.getBoundingClientRect().top + 40;
+  let current = 0;
+  state.pages.forEach((page, index) => {
+    if (page.wrapper.getBoundingClientRect().top <= top) current = index;
+  });
+  return current;
+}
+
+function updateCurrentPage() {
+  if (state.pages.length) $("pageInput").value = String(currentPageIndex() + 1);
+}
+
+function scrollToPage(index) {
+  const page = state.pages[Math.min(Math.max(index, 0), state.pages.length - 1)];
+  if (!page) return;
+  viewport.scrollTop += page.wrapper.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 8;
+}
+
+/* ---------- Search ---------- */
+
+function runSearch() {
+  const query = $("search").value.trim().toLowerCase();
+  const matches = [];
+  if (query) {
+    for (const page of state.pages) {
+      page.wordTexts.forEach((text, index) => { if (text.includes(query)) matches.push({ page, index }); });
+    }
+  }
+  state.search = { query, matches, cursor: -1 };
+  state.pages.forEach(applyPageHighlights);
+  updateSearchCount();
+}
+
+function applyPageHighlights(page) {
+  page.wordBoxes.forEach((box) => box && box.classList.remove("match", "current"));
+  const { matches, cursor } = state.search;
+  matches.forEach((match, matchIndex) => {
+    if (match.page !== page) return;
+    const box = page.wordBoxes[match.index];
+    if (box) box.classList.add("match", matchIndex === cursor ? "current" : "match");
+  });
+}
+
+function updateSearchCount() {
+  const { query, matches, cursor } = state.search;
+  const text = !query ? "" : matches.length === 0 ? "No matches"
+    : cursor < 0 ? `${matches.length} match${matches.length === 1 ? "" : "es"}` : `${cursor + 1} of ${matches.length}`;
+  $("searchCount").textContent = text;
+}
+
+function jumpToMatch(direction) {
+  const { matches, cursor } = state.search;
+  if (matches.length === 0) return;
+  const previous = matches[cursor];
+  state.search.cursor = (cursor + direction + matches.length) % matches.length;
+  if (cursor < 0 && direction < 0) state.search.cursor = matches.length - 1;
+  const target = matches[state.search.cursor];
+  renderPage(target.page);
+  if (previous) applyPageHighlights(previous.page);
+  applyPageHighlights(target.page);
+  updateSearchCount();
+  const box = target.page.wordBoxes[target.index];
+  if (box) box.scrollIntoView({ block: "center", inline: "center" });
+}
+
+/* ---------- Inspection: tooltip and click highlight ---------- */
+
+function describeBox(info) {
+  const lines = [info.path, `bbox  ${info.element.getAttribute("bbox")}`];
+  for (const attribute of Array.from(info.element.attributes)) {
+    if (attribute.name !== "bbox") lines.push(`${attribute.name}=${attribute.value}`);
+  }
+  if (info.kind === "word") lines.push(`text  ${info.element.textContent}`);
+  return lines.join("\n");
+}
+
+function onPointerMove(event) {
+  const tooltip = $("tooltip");
+  const info = boxInfo.get(event.target);
+  if (!info) { tooltip.hidden = true; return; }
+  tooltip.textContent = describeBox(info);
+  tooltip.hidden = false;
+  const x = Math.min(event.clientX + 14, window.innerWidth - tooltip.offsetWidth - 8);
+  const y = event.clientY + 18 + tooltip.offsetHeight > window.innerHeight ? event.clientY - tooltip.offsetHeight - 10 : event.clientY + 18;
+  tooltip.style.left = `${Math.max(0, x)}px`;
+  tooltip.style.top = `${Math.max(0, y)}px`;
+}
+
+function clearHighlight() {
+  pagesEl.querySelectorAll(".hl").forEach((box) => box.classList.remove("hl"));
+}
+
+function onPageClick(event) {
+  if (!window.getSelection().isCollapsed) return;   // the click ended a text selection
+  clearHighlight();
+  let info = boxInfo.get(event.target);
+  if (!info || info.kind !== "word") return;
+  let nearestCell = true;
+  for (let box = info.parent; box; box = boxInfo.get(box).parent) {
+    const kind = boxInfo.get(box).kind;
+    if (kind === "table" || (kind === "cell" && nearestCell)) box.classList.add("hl");
+    if (kind === "cell") nearestCell = false;
+  }
+}
+
+/* ---------- Copy keeps reading order and line structure ---------- */
+
+function selectedWordText() {
+  const selection = window.getSelection();
+  if (selection.rangeCount === 0 || selection.isCollapsed) return null;
+  const range = selection.getRangeAt(0);
+  const words = [];
+  for (const page of state.pages) {
+    if (!page.rendered || !range.intersectsNode(page.sheet)) continue;
+    for (const box of page.wordBoxes) if (box && range.intersectsNode(box)) words.push(box);
+  }
+  if (words.length < 2) return null;   // let the browser copy partial text of a single word
+  return words.map((box, index) => {
+    if (index === 0) return box.textContent;
+    const sameLine = boxInfo.get(box).parent === boxInfo.get(words[index - 1]).parent;
+    return (sameLine ? " " : "\n") + box.textContent;
+  }).join("");
+}
+
+function onCopy(event) {
+  const text = selectedWordText();
+  if (text === null) return;
+  event.clipboardData.setData("text/plain", text);
+  event.preventDefault();
+}
+
+/* ---------- Toolbar wiring ---------- */
+
+function buildToolbar() {
+  const zoomSelect = $("zoomSelect");
+  zoomSelect.append(new Option("Fit width", "fit"));
+  ZOOM_LEVELS.forEach((level) => zoomSelect.append(new Option(`${Math.round(level * 100)}%`, String(level))));
+
+  OVERLAYS.forEach(([key, labelText, initial]) => {
+    const label = document.createElement("label");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = initial;
+    const toggle = () => pagesEl.classList.toggle(`show-${key}`, checkbox.checked);
+    checkbox.addEventListener("change", toggle);
+    toggle();
+    label.append(checkbox, labelText);
+    $("toggles").append(label);
+  });
+
+  ["0", "1", "2", "3+"].forEach((text, depth) => {
+    const item = document.createElement("span");
+    item.className = `d${depth}`;
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    item.append(swatch, ` ${text}`);
+    $("legend").append(item);
+  });
+  $("legend").prepend("Table depth:");
+}
+
+function wireEvents() {
+  $("openButton").addEventListener("click", () => $("folderInput").click());
+  $("folderInput").addEventListener("change", handleFolderPicked);
+  $("zoomSelect").addEventListener("change", (e) => setZoomMode(e.target.value === "fit" ? "fit" : Number(e.target.value)));
+  $("zoomIn").addEventListener("click", () => stepZoom(1));
+  $("zoomOut").addEventListener("click", () => stepZoom(-1));
+  $("pageInput").addEventListener("change", (e) => scrollToPage(Number(e.target.value) - 1));
+  $("search").addEventListener("input", runSearch);
+  $("search").addEventListener("keydown", (e) => { if (e.key === "Enter") jumpToMatch(e.shiftKey ? -1 : 1); });
+  $("searchNext").addEventListener("click", () => jumpToMatch(1));
+  $("searchPrev").addEventListener("click", () => jumpToMatch(-1));
+
+  viewport.addEventListener("scroll", () => requestAnimationFrame(updateCurrentPage), { passive: true });
+  window.addEventListener("resize", () => { if (state.zoomMode === "fit") applyZoom(); });
+  pagesEl.addEventListener("mousemove", onPointerMove);
+  pagesEl.addEventListener("mouseleave", () => { $("tooltip").hidden = true; });
+  pagesEl.addEventListener("click", onPageClick);
+  document.addEventListener("copy", onCopy);
+
+  window.addEventListener("dragover", (e) => { e.preventDefault(); viewport.classList.add("dragging"); });
+  window.addEventListener("dragleave", (e) => { if (!e.relatedTarget) viewport.classList.remove("dragging"); });
+  window.addEventListener("drop", handleDrop);
+}
+
+buildToolbar();
+wireEvents();
+startFromQuery();
+</script>
+</body>
+</html>

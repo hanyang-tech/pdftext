@@ -1,0 +1,40 @@
+VERDICT: APPROVED
+THREAT MODEL COVERAGE:
+| Abuse case | Mitigation in code | Test | Status |
+|---|---|---|---|
+| 1 Stream bomb through any filter, predictor or chain | Nine bounded decode filters installed in `pdfminer.pdftypes` (`src/pdftext/adapter.py:82-292`), limit set per thread by `_bounded_streams` (adapter.py:296) around `open_document`, `advance` and `read`; an over-limit stream at open is a `PdftextError`, never repaired (adapter.py:502, 553) | `tests/test_limits_run.py` `TestStreamThatInflatesPastTheLimit` (9 bombs, peak RSS < 1 GiB), `tests/test_decode_filters.py` (exact limit and one byte over, per filter), `tests/test_stream_limit.py:178-278` (catalog and page 1 never reach PDFium) | covered |
+| 2 CPU bomb | Watchdog page timeout, page error, run goes on (`src/pdftext/limits.py:180-197`, `src/pdftext/api.py:67-79`) | `tests/test_limits_run.py:247` (10^9 draws, error page in < 3 s, page 2 read) | covered |
+| 3 Stuck in one C call: (a) GIL-holding, (b) GIL-releasing | (a) linear ASCII85 strip (adapter.py:182-200) and SIGALRM handler on the main thread with `hard_stop` (limits.py:111-128, 199-211); (b) hard stop after `grace_s` (limits.py:195-196, 230-233). Remaining gap is Risk 14, accepted | `tests/test_limits_run.py:263` (b), `:282` (a, three pages each stopped at 2 s), `tests/test_watchdog.py:347-575` (alarm unit cases), `tests/test_decode_filters.py:281-418` (strip equivalence and speed). Some alarm corners untested: backlog #66 | covered (accepted gap per Risk 14) |
+| 4 Memory exhaustion by other routes | Peak-RSS poll, fatal `MemoryLimit` (limits.py:214-215), mapped to exit 2 (api.py:56-58). Accepted | `tests/test_limits_run.py:359`, `tests/test_watchdog.py:241-252` | covered (accepted) |
+| 5 Huge file, huge or lying page count | `stat` size check (adapter.py:475-481), repair read capped at `max_file_bytes + 1` (adapter.py:667-671), `/Count` check (adapter.py:536), per-step page count (adapter.py:438) | `tests/test_limits_run.py` SEC-5 class | covered |
+| 6 Character flood | `_counting_render_char` and `_bounded_chars` (adapter.py:316-343) | `tests/test_limits_run.py` SEC-6 class | covered |
+| 7 Deep table nesting | `max_table_depth` in `build_forest` and `_table_from_grid` (`src/pdftext/pipeline.py:35-39, 73-111`) | `tests/test_nesting.py`, `tests/test_nesting_edges.py`, `tests/test_inferred_levels.py`, `tests/test_tables.py` (SEC-7) | covered |
+| 8 Markup or forbidden characters in text | `sanitize_chars` (`src/pdftext/text.py:24`), ElementTree escaping (`src/pdftext/xmlwriter.py:83-85, 120-123`) | `tests/test_xmlwriter.py:140`, `tests/test_text.py:32, 90`, `tests/test_api.py:260` | covered |
+| 9 Injection through error text or parser logs | Closed message vocabulary, `LimitStop.message` constants (limits.py:44-67), `_report` keeps printable chars only (`src/pdftext/cli.py:80-83`), `NullHandler` and `propagate=False` (adapter.py:49-51) | `tests/test_parser_logging.py:34, 59`, `tests/test_cli.py:33, 81, 92` | covered (C1/bidi: backlog #52; script names: #56, #58) |
+| 10 Planted symlink | `O_EXCL` temp plus `os.replace`, unlink without following (xmlwriter.py:172-194) | `tests/test_api.py:368, 388`, `tests/test_isolation.py:153`, `tests/test_xmlwriter_files.py` | covered |
+| 11 Stale `document.xml` | `prepare` unlinks before input is read, `document.xml` written last (xmlwriter.py:172-179, api.py:93-103) | `tests/test_api.py:330, 341, 349`, `tests/test_cli.py:251` | covered |
+| 12 Host details in output | No path, clock or ID reaches XML; CLI `OSError` reports `strerror` only (cli.py:60-61) | `tests/test_api.py:288, 298, 312`, `tests/test_cli.py:194` | covered |
+| 13 Subprocess or network | No `repair=True` (adapter.py:663), no such import in `src/` | `tests/test_isolation.py:63` (audit hook), `tests/audit_probe.py` | covered |
+| 14 `/Encoding` file read or pickle | `pdfminer.six>=20251107` floor (`pyproject.toml:9`) | `tests/test_isolation.py` (audit hook over runs), `tests/audit_probe.py` | covered |
+| 15 Non-finite coordinates | `_require_finite` (adapter.py:462, 779-791, 818) | `tests/test_page_failures.py:183, 251, 262`, `tests/test_reading_order_edges.py:47` | covered |
+| 16 PDFium exploit, encrypted input | `_recording_initialize_password` record (adapter.py:358-368), encrypted input refused before repair (adapter.py:505-508, 557-560), size bound (adapter.py:667-671). Exploit risk accepted (Risk 8) | `tests/test_encrypted_input.py`, `tests/test_repair.py`, `tests/test_pdfium_worker.py` (with `pdfium_spies.py`) | covered (residual accepted) |
+| 17 Disk filling | Char cap plus total timeout. Accepted | none (accepted, no test required) | accepted |
+| 18 Reference cycles | Watchdog over `open_document` and each `advance` with `StructureTimeout` (api.py:50-64), per-entry faults in `_walk_tree` (adapter.py:710) | `tests/test_structure_timeouts.py`, `tests/test_adapter_limits.py` | covered |
+| 19 Crafted page tree | Own walker `_walk_pages` / `_walk_tree` (adapter.py:695-760) | `tests/test_page_failures.py` (SEC-17) | covered |
+| 20 PDFium driven unsafely | One worker thread, caller polls `Event`, abandoned jobs (adapter.py:564-657) | `tests/test_pdfium_worker.py` (SEC-18) | covered (Risk 12 residuals; backlog #35) |
+| 21 Concurrent stream limits | Per-thread `_StreamLimit`, originals when unset (adapter.py:56-63, 291-303) | `tests/test_stream_limit.py:51-168`, `tests/test_decode_filters.py:487` | covered |
+| 22 Flate bomb on the repair path | Only `max_file_bytes` and the memory poll. Accepted, backlog #41 | none (accepted) | accepted |
+FINDINGS:
+none
+PATTERNS:
+| PAT-1 | followed |
+| PAT-2 | followed (only `src/pdftext/adapter.py` imports pdfminer, pdfplumber or pypdfium2) |
+| PAT-3 | followed (iteration 5 touched only `limits.py`, `adapter.py` and the CLI path; the stages are unchanged) |
+| PAT-4 | followed |
+CASES WALKED: 57 functions · 33 cases · 30 handled and tested · 0 wrong (findings) · 3 handled but untested (listed below)
+UNTESTED CASES:
+[U1] src/pdftext/api.py:82-104 · library `convert(..., hard_stop=True)` on the main thread with a host Python SIGALRM handler, in-process: after a run with a timed-out page, and after a run ended by an `OSError` from `OutputDir.write` (the generator is dropped, not closed), the host handler is back, the thread's stream and char limits are `None`, and no stop lands while the host works between pages. Every alarm test drives `Watchdog` alone or the CLI in a subprocess. A probe confirms the behavior (`security-2/alarm_probe.py`, `write_fail_probe.py` in the session scratchpad) · design API: "restores the previous SIGALRM handler afterwards"; SEC-19 (no leftover limit)
+[U2] src/pdftext/adapter.py:221-231 · an ASCII85 stream of only `z` that decodes to just under the 32 MiB default (8,388,608 `z`s gives 8 M empty runs in `split`): measured 195 MiB of peak growth and 1.5 s, against 739 MiB for pdfminer's own decoder. The only memory test is the 256 MiB bomb, which is refused before `split` · design AC-25 defaults: decoding at 32 MiB costs at most about 300 MiB
+[U3] src/pdftext/api.py:97-99 · in the same library `hard_stop=True` run, an `OSError` raised by `output.write` after a page leaves no SIGALRM timer running (it was cleared by the step's `disarm`), so no tick reaches the host's handler after it is restored · unspecified (follows from the Alarm contract: the timer runs only inside an armed step)
+DESIGN ISSUES: none
+RESOLVED FROM LAST ROUND: #1 (MAJOR, `max_stream_bytes` bounded only Flate) → resolved. All nine decode routes are bounded or refused under a limit (adapter.py:82-292), including the Flate corrupt-data retry. The bomb matrix in `tests/test_limits_run.py:119-160` passes with peak RSS under 1 GiB. The ASCII85 route also matches pdfminer's strip regexes (probe: exhaustive to length 5 over 11 symbols including `\t`, `\r`, `\f`, `z`, and 200,000 random inputs, with 0 mismatches in output or error type). The only BLOCKER or MAJOR in `release/security.md` was #1; its MINORs went to backlog #45, #46 (done) and #52 (open).

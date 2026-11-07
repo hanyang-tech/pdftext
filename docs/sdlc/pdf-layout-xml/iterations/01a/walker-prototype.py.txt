@@ -1,0 +1,71 @@
+"""Own page-tree walker: one result per /Kids entry."""
+from lib import *
+from pdfminer.pdfpage import LITERAL_PAGE, LITERAL_PAGES
+from pdfminer.pdftypes import PDFObjRef, resolve1
+from pdfminer.pdfexceptions import PDFObjectNotFound
+INHERITED = PDFPage.INHERITABLE_ATTRS
+class Slot:
+    __slots__=("page","failure")
+    def __init__(s,page,failure): s.page=page; s.failure=failure
+class NotAPage(Exception): pass
+def _load(doc, entry, parent):
+    node = resolve1(entry)
+    if not isinstance(node, dict): raise NotAPage
+    return node
+def walk_pages(doc):
+    found=False
+    if "Pages" in doc.catalog:
+        stack=[(doc.catalog["Pages"],doc.catalog,True)]; seen=set()
+        while stack:
+            entry,parent,is_root=stack.pop()
+            kids=None; slot=None
+            try:
+                oid = entry.objid if isinstance(entry,PDFObjRef) else None
+                if oid is not None and oid in seen: raise NotAPage
+                if oid is not None: seen.add(oid)
+                node=_load(doc,entry,parent)
+                attrs=dict(node)
+                for k,v in parent.items():
+                    if k in INHERITED and k not in attrs: attrs[k]=v
+                kind=attrs.get("Type") or attrs.get("type")
+                if kind is LITERAL_PAGES and "Kids" in attrs:
+                    kids=resolve1(attrs["Kids"])
+                    if not isinstance(kids,list): raise NotAPage
+                elif kind is LITERAL_PAGE:
+                    slot=Slot(PDFPage(doc,oid,attrs,None),None)
+                else:
+                    raise NotAPage
+            except NotAPage:
+                if is_root: break          # as pdfminer: an unusable root falls back to the xref scan
+                slot=Slot(None,NotAPage()); kids=None
+            except (Exception,Stop) as exc:
+                if is_root: raise
+                slot=Slot(None,exc); kids=None
+            if kids is not None:
+                for kid in reversed(kids): stack.append((kid,attrs,False))
+                continue
+            found=True
+            yield slot
+    if not found:
+        for xref in doc.xrefs:
+            for objid in xref.get_objids():
+                try: obj=doc.getobj(objid)
+                except PDFObjectNotFound: continue
+                if isinstance(obj,dict) and obj.get("Type") is LITERAL_PAGE:
+                    try: slot=Slot(PDFPage(doc,objid,obj,None),None)
+                    except (Exception,Stop) as exc: slot=Slot(None,exc)
+                    yield slot
+def walkw(path,after=0.2):
+    fp,pdf=opened(path); r=[]; it=walk_pages(pdf.doc); n=0
+    try:
+        while n<20:
+            done=threading.Event(); arm(threading.get_ident(),after,done); t=time.monotonic()
+            try: s=next(it)
+            except StopIteration: done.set(); r.append("end"); break
+            except BaseException as e: done.set(); r.append(f"RUN-ENDS {type(e).__name__} {time.monotonic()-t:.2f}s; next->"+nxt(it)); break
+            done.set(); n+=1
+            if s.failure is not None: r.append(f"p{n} failed:{type(s.failure).__name__} {time.monotonic()-t:.2f}s"); continue
+            try: r.append(f"p{n}={text_of(pdf,s.page,n)!r}")
+            except Exception as e: r.append(f"p{n} read:{type(e).__name__}")
+    finally: fp.close()
+    return r

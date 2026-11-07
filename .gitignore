@@ -10,3 +10,8 @@ dist/
 build/
 *.egg-info/
 .DS_Store
+/out/
+
+# ACORD forms are licensed and must not be committed: the blank templates and anything made from them.
+/output/
+/tests/fixtures/acord/blank/

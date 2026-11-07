@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Schema for document.xml and page-NNNN.xml. There is no namespace. Text appears only in word. -->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" elementFormDefault="unqualified">
+
+  <!-- Simple types -->
+  <xs:simpleType name="BBox">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="(-?[0-9]+\.[0-9]{2} ){3}-?[0-9]+\.[0-9]{2}"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Status">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="ok"/>
+      <xs:enumeration value="no-text"/>
+      <xs:enumeration value="error"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Detection">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="ruled"/>
+      <xs:enumeration value="text"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Rotation">
+    <xs:restriction base="xs:integer">
+      <xs:minInclusive value="1"/>
+      <xs:maxInclusive value="359"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="TrueOnly">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="true"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="SchemaVersion">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="1"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="PageHref">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="page-[0-9]{4,}\.xml"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Content elements -->
+  <xs:complexType name="WordType">
+    <xs:simpleContent>
+      <xs:extension base="xs:string">
+        <xs:attribute name="bbox" type="BBox" use="required"/>
+        <xs:attribute name="rotation" type="Rotation"/>
+      </xs:extension>
+    </xs:simpleContent>
+  </xs:complexType>
+
+  <xs:complexType name="LineType">
+    <xs:sequence>
+      <xs:element name="word" type="WordType" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="bbox" type="BBox" use="required"/>
+    <xs:attribute name="rotation" type="Rotation"/>
+  </xs:complexType>
+
+  <xs:complexType name="RegionType">
+    <xs:sequence>
+      <xs:element name="line" type="LineType" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="bbox" type="BBox" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="FigureType">
+    <xs:attribute name="bbox" type="BBox" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="CellType">
+    <xs:group ref="Blocks"/>
+    <xs:attribute name="bbox" type="BBox" use="required"/>
+    <xs:attribute name="col" type="xs:nonNegativeInteger" use="required"/>
+    <xs:attribute name="colspan" type="xs:positiveInteger"/>
+    <xs:attribute name="rowspan" type="xs:positiveInteger"/>
+    <xs:attribute name="overflow" type="TrueOnly"/>
+  </xs:complexType>
+
+  <xs:complexType name="RowType">
+    <xs:sequence>
+      <xs:element name="cell" type="CellType" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="bbox" type="BBox" use="required"/>
+    <xs:attribute name="index" type="xs:nonNegativeInteger" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="TableType">
+    <xs:sequence>
+      <xs:element name="row" type="RowType" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="bbox" type="BBox" use="required"/>
+    <xs:attribute name="rows" type="xs:positiveInteger" use="required"/>
+    <xs:attribute name="cols" type="xs:positiveInteger" use="required"/>
+    <xs:attribute name="detection" type="Detection" use="required"/>
+    <xs:attribute name="inferred" type="TrueOnly"/>
+  </xs:complexType>
+
+  <!-- Blocks, in reading order, are what a page and a cell hold. -->
+  <xs:group name="Blocks">
+    <xs:sequence>
+      <xs:choice minOccurs="0" maxOccurs="unbounded">
+        <xs:element name="region" type="RegionType"/>
+        <xs:element name="table" type="TableType"/>
+        <xs:element name="figure" type="FigureType"/>
+      </xs:choice>
+    </xs:sequence>
+  </xs:group>
+
+  <!-- page-NNNN.xml -->
+  <xs:element name="page">
+    <xs:complexType>
+      <xs:group ref="Blocks"/>
+      <xs:attribute name="schema-version" type="SchemaVersion" use="required"/>
+      <xs:attribute name="number" type="xs:positiveInteger" use="required"/>
+      <xs:attribute name="bbox" type="BBox" use="required"/>
+      <xs:attribute name="status" type="Status" use="required"/>
+      <xs:attribute name="message" type="xs:string"/>
+      <xs:attribute name="replaced-chars" type="xs:positiveInteger"/>
+      <xs:attribute name="overflow" type="TrueOnly"/>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- document.xml -->
+  <xs:element name="document">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="page" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:attribute name="number" type="xs:positiveInteger" use="required"/>
+            <xs:attribute name="href" type="PageHref" use="required"/>
+            <xs:attribute name="status" type="Status" use="required"/>
+            <xs:attribute name="bbox" type="BBox" use="required"/>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+      <xs:attribute name="schema-version" type="SchemaVersion" use="required"/>
+      <xs:attribute name="pages" type="xs:positiveInteger" use="required"/>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>
