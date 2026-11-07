@@ -46,6 +46,20 @@ from an earlier one's only in case (`x.pdf` and `x.PDF`) is skipped and counted 
 PDFs never share an output folder. The script exits with the most severe exit code it saw, ranked
 1, then 2, then 3, then 0 (the table below), not the highest number.
 
+### Viewing the output
+
+```
+uv run python scripts/view.py out/nested/
+```
+
+This starts a server on `127.0.0.1` (port 8765, or the next free one; `--port N` to choose,
+`--no-browser` to only print the URL) and opens the viewer on the folder `pdftext` wrote. The
+viewer redraws each page with its words at their positions. Overlays for regions, lines, words,
+tables, cells, figures and reading order can be switched on and off. Hovering shows an element's
+path and bounding box, clicking a word outlines its cell and tables, and there are search and zoom.
+Re-run `pdftext` and reload to see new output. `viewer/index.html` also opens straight from disk:
+use its "Open folder" button or drop the output folder on it.
+
 ### Exit codes
 
 | Code | Meaning |
